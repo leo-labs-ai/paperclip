@@ -411,6 +411,7 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
     const rootRunId = randomUUID();
     const deepDescendantRunId = randomUUID();
     const forgedRunId = randomUUID();
+    const outsiderRunId = randomUUID();
     const rootWakeupRequestId = randomUUID();
     const deepDescendantWakeupRequestId = randomUUID();
     const forgedWakeupRequestId = randomUUID();
@@ -550,6 +551,15 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
           source: "issue.comment",
         },
       },
+      {
+        id: outsiderRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: {},
+      },
     ]);
 
     const treeSvc = issueTreeControlService(db);
@@ -570,6 +580,12 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
     const issueSvc = issueService(db);
     await expect(
       issueSvc.checkout(deepDescendantIssueId, agentId, ["todo"], randomUUID()),
+    ).rejects.toMatchObject({
+      status: 422,
+      message: "unknown_run_id",
+    });
+    await expect(
+      issueSvc.checkout(deepDescendantIssueId, agentId, ["todo"], outsiderRunId),
     ).rejects.toMatchObject({
       status: 409,
       details: expect.objectContaining({
