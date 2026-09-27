@@ -31,33 +31,92 @@ const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
   hasPermission: vi.fn(async () => false),
 }));
-const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
-  for: () => ({
-    then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-      Promise.resolve([{
-        id: "55555555-5555-4555-8555-555555555555",
-        companyId: "company-1",
-        agentId: "33333333-3333-4333-8333-333333333333",
-        contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-        permissions: null,
-      }]).then(onFulfilled, onRejected),
-  }),
-  then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-    Promise.resolve([{
-      id: "55555555-5555-4555-8555-555555555555",
-      companyId: "company-1",
-      agentId: "33333333-3333-4333-8333-333333333333",
-      contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-      permissions: null,
-    }]).then(onFulfilled, onRejected),
-})));
+const scopedRunRow = {
+  id: "55555555-5555-4555-8555-555555555555",
+  companyId: "company-1",
+  agentId: "33333333-3333-4333-8333-333333333333",
+  contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+  permissions: null,
+  general: {},
+};
+let heartbeatRunRows: unknown[] = [scopedRunRow];
+
+function rowsThen(rows: unknown[]) {
+  const promise = Promise.resolve(rows);
+  return {
+    then: (
+      onFulfilled?: (rows: unknown[]) => unknown,
+      onRejected?: (reason: unknown) => unknown,
+    ) => promise.then(onFulfilled, onRejected),
+  };
+}
+
+// Production scope checks are `.where().limit(1)` and `.where().for("key share").limit(1)`.
+// Activity writes are `.insert().values().returning({ id })`.
+function heartbeatRunWhere() {
+  const rows = () => heartbeatRunRows;
+  const limited = () => rowsThen(rows());
+  return {
+    limit: () => limited(),
+    for: () => ({
+      limit: () => limited(),
+      then: (
+        onFulfilled?: (selected: unknown[]) => unknown,
+        onRejected?: (reason: unknown) => unknown,
+      ) => Promise.resolve(rows()).then(onFulfilled, onRejected),
+    }),
+    then: (
+      onFulfilled?: (selected: unknown[]) => unknown,
+      onRejected?: (reason: unknown) => unknown,
+    ) => Promise.resolve(rows()).then(onFulfilled, onRejected),
+  };
+}
+
+function insertChain() {
+  const pending = Promise.resolve(undefined);
+  const activityId = "77777777-7777-4777-8777-777777777777";
+  return {
+    values: () => Object.assign(pending, {
+      returning: () => Promise.resolve([{ id: activityId }]),
+      onConflictDoNothing: () => ({ returning: () => Promise.resolve([]) }),
+      onConflictDoUpdate: () => ({
+        returning: () => Promise.resolve([{
+          id: "instance-settings-1",
+          general: {},
+          experimental: {},
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }]),
+      }),
+    }),
+  };
+}
+
+function updateChain() {
+  const pending = Promise.resolve(undefined);
+  return {
+    set: () => ({
+      where: () => Object.assign(pending, {
+        returning: () => Promise.resolve([]),
+      }),
+    }),
+  };
+}
+
+const mockDbSelectWhere = vi.hoisted(() => vi.fn());
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
-const mockDb = vi.hoisted(() => ({
-  select: mockDbSelect,
-  transaction: vi.fn(async (callback: (tx: { select: typeof mockDbSelect }) => Promise<unknown>) =>
-    callback({ select: mockDbSelect })),
-}));
+const mockDbInsert = vi.hoisted(() => vi.fn());
+const mockDbUpdate = vi.hoisted(() => vi.fn());
+const mockDb = vi.hoisted(() => {
+  const db = {
+    select: mockDbSelect,
+    insert: mockDbInsert,
+    update: mockDbUpdate,
+    transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback(db)),
+  };
+  return db;
+});
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
@@ -80,7 +139,9 @@ function registerModuleMocks() {
     RunnerGoalConflictError: class RunnerGoalConflictError extends Error {},
   }));
 
-  vi.doMock("../services/index.js", () => ({
+  vi.doMock("../services/index.js", async () => {
+    const activity = await import("../services/activity-log.js");
+    return {
     companyService: () => ({
       getById: vi.fn(async () => ({ id: "company-1" })),
     }),
@@ -147,12 +208,29 @@ function registerModuleMocks() {
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: mockLogActivity,
+    persistActivity: async (
+      db: { insert: () => { values: () => { returning: () => Promise<Array<{ id: string }>> } } },
+      input: { companyId: string },
+    ) => {
+      await mockLogActivity(db, input, []);
+      const [row] = await db.insert().values().returning();
+      return {
+        activity: row,
+        publication: {
+          companyId: input.companyId,
+          payload: input,
+          pluginEvent: null,
+        },
+      };
+    },
+    publishActivity: activity.publishActivity,
     projectService: () => ({}),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
     workProductService: () => ({}),
-  }));
+  };
+  });
 }
 
 type TestActor =
@@ -209,28 +287,12 @@ describe("issue execution policy routes", () => {
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
+    heartbeatRunRows = [scopedRunRow];
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
-    mockDbSelectWhere.mockImplementation(() => ({
-      for: () => ({
-        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-          Promise.resolve([{
-            id: "55555555-5555-4555-8555-555555555555",
-            companyId: "company-1",
-            agentId: "33333333-3333-4333-8333-333333333333",
-            contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-            permissions: null,
-          }]).then(onFulfilled, onRejected),
-      }),
-      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve([{
-          id: "55555555-5555-4555-8555-555555555555",
-          companyId: "company-1",
-          agentId: "33333333-3333-4333-8333-333333333333",
-          contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-          permissions: null,
-        }]).then(onFulfilled, onRejected),
-    }));
+    mockDbSelectWhere.mockImplementation(() => heartbeatRunWhere());
+    mockDbInsert.mockImplementation(() => insertChain());
+    mockDbUpdate.mockImplementation(() => updateChain());
     mockIssueService.createChild.mockResolvedValue({
       issue: {
         id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -301,6 +363,40 @@ describe("issue execution policy routes", () => {
     expect(mockDb.transaction).toHaveBeenCalled();
     expect(mockIssueService.getByIdForUpdate).toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("returns 422 unknown_run_id when the company run row is missing", async () => {
+    heartbeatRunRows = [];
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1002",
+      title: "Missing run",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ title: "Still missing" });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({
+      error: "unknown_run_id",
+      details: { code: "unknown_run_id", source: "header" },
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockDbInsert).not.toHaveBeenCalled();
   });
 
   it("rejects an agent-authored in_review transition without a review path", async () => {

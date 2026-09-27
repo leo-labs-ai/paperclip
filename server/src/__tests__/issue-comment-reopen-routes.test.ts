@@ -1,7 +1,79 @@
 import express from "express";
 import request from "supertest";
+import { getTableName, type SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
+
+const DEFAULT_SCOPED_RUN_ID = "99999999-9999-4999-8999-999999999901";
+const ASSIGNEE_SELF_RUN_ID = "99999999-9999-4999-8999-999999999911";
+const REASSIGN_RUN_ID = "99999999-9999-4999-8999-999999999912";
+const BOARD_OWNING_RUN_ID = "99999999-9999-4999-8999-999999999913";
+const REVIEWER_RUN_ID = "99999999-9999-4999-8999-999999999914";
+
+type ScopedHeartbeatRun = {
+  id: string;
+  companyId: string;
+  agentId: string | null;
+};
+
+const scopedHeartbeatRuns: ScopedHeartbeatRun[] = [];
+const heartbeatRunDialect = new PgDialect();
+
+function rememberScopedRun(run: ScopedHeartbeatRun) {
+  const id = run.id.trim().toLowerCase();
+  const index = scopedHeartbeatRuns.findIndex(
+    (row) => row.id === id && row.agentId === run.agentId,
+  );
+  const next = { ...run, id };
+  if (index >= 0) scopedHeartbeatRuns[index] = next;
+  else scopedHeartbeatRuns.push(next);
+}
+
+function clearScopedRuns() {
+  scopedHeartbeatRuns.length = 0;
+}
+
+function predicateParams(condition: unknown): string[] {
+  if (!condition || typeof condition !== "object") return [];
+  try {
+    return heartbeatRunDialect
+      .sqlToQuery(condition as SQL)
+      .params.map((value) => String(value));
+  } catch {
+    return [];
+  }
+}
+
+function tableNameOf(table: unknown): string {
+  try {
+    return getTableName(table as Parameters<typeof getTableName>[0]);
+  } catch {
+    return "";
+  }
+}
+
+function isHeartbeatRunIdSelection(table: unknown, selection: unknown): boolean {
+  if (tableNameOf(table) !== "heartbeat_runs") return false;
+  if (!selection || typeof selection !== "object") return false;
+  const keys = Object.keys(selection as Record<string, unknown>);
+  return keys.length === 1 && keys[0] === "id";
+}
+
+// A row is visible only when the predicate binds that run, its company, and its
+// agent when an agent predicate is present. `FOR KEY SHARE` does not change that.
+function scopedHeartbeatRunIds(condition: unknown): Array<{ id: string }> {
+  const params = predicateParams(condition);
+  return scopedHeartbeatRuns
+    .filter((row) => {
+      if (!params.includes(row.id) || !params.includes(row.companyId)) return false;
+      const extras = params.filter((value) => value !== row.id && value !== row.companyId);
+      if (extras.length === 0) return true;
+      return row.agentId !== null && extras.includes(row.agentId);
+    })
+    .slice(0, 1)
+    .map((row) => ({ id: row.id }));
+}
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -38,36 +110,80 @@ const mockAgentService = vi.hoisted(() => ({
   resolveByReference: vi.fn(),
 }));
 
-const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+const mockLogActivity = vi.hoisted(() =>
+  vi.fn(async (_db?: unknown, _input?: Record<string, unknown>) => undefined),
+);
 const mockTxInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
 const mockTxInsert = vi.hoisted(() =>
   vi.fn(() => ({ values: mockTxInsertValues })),
 );
+const mockDbUpdateWhere = vi.hoisted(() => vi.fn(async () => undefined));
+const mockDbUpdateSet = vi.hoisted(() => vi.fn(() => ({ where: mockDbUpdateWhere })));
+const mockDbUpdate = vi.hoisted(() => vi.fn(() => ({ set: mockDbUpdateSet })));
 const mockTx = vi.hoisted(() => ({
   insert: mockTxInsert,
+  select: vi.fn(),
+  update: mockDbUpdate,
 }));
 const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
+type MockSelectWhereResult = {
+  then: (
+    onFulfilled: (rows: unknown[]) => unknown,
+    onRejected?: (reason: unknown) => unknown,
+  ) => Promise<unknown>;
+};
 const mockDbSelectWhere = vi.hoisted(() =>
-  vi.fn(() => ({
-    orderBy: mockDbSelectOrderBy,
-    then: (
-      onFulfilled: (rows: unknown[]) => unknown,
-      onRejected?: (reason: unknown) => unknown,
-    ) => Promise.resolve([]).then(onFulfilled, onRejected),
-  })),
+  vi.fn<(condition?: unknown, table?: unknown, selection?: unknown) => MockSelectWhereResult>(),
 );
 const mockDbSelectFrom = vi.hoisted(() =>
-  vi.fn(() => ({ where: mockDbSelectWhere })),
+  vi.fn<(table?: unknown, selection?: unknown) => {
+    where: (condition?: unknown) => MockSelectWhereResult;
+  }>(),
 );
 const mockDbSelect = vi.hoisted(() =>
-  vi.fn(() => ({ from: mockDbSelectFrom })),
+  vi.fn<(selection?: Record<string, unknown>) => {
+    from: (table?: unknown) => ReturnType<typeof mockDbSelectFrom>;
+  }>(),
 );
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
+  update: mockDbUpdate,
   transaction: vi.fn(async (fn: (tx: typeof mockTx) => Promise<unknown>) =>
     fn(mockTx),
   ),
 }));
+
+function rowsThen(rows: unknown[]) {
+  const promise = Promise.resolve(rows);
+  return {
+    then: (
+      onFulfilled?: (selected: unknown[]) => unknown,
+      onRejected?: (reason: unknown) => unknown,
+    ) => promise.then(onFulfilled, onRejected),
+  };
+}
+
+function selectWhereResult(condition: unknown, table: unknown, selection: unknown) {
+  const scopeRows = isHeartbeatRunIdSelection(table, selection)
+    ? scopedHeartbeatRunIds(condition)
+    : [];
+  const limited = () => rowsThen(scopeRows);
+  return {
+    orderBy: mockDbSelectOrderBy,
+    limit: () => limited(),
+    for: () => ({
+      limit: () => limited(),
+      then: (
+        onFulfilled?: (selected: unknown[]) => unknown,
+        onRejected?: (reason: unknown) => unknown,
+      ) => Promise.resolve(scopeRows).then(onFulfilled, onRejected),
+    }),
+    then: (
+      onFulfilled?: (selected: unknown[]) => unknown,
+      onRejected?: (reason: unknown) => unknown,
+    ) => Promise.resolve([]).then(onFulfilled, onRejected),
+  };
+}
 const mockFeedbackService = vi.hoisted(() => ({
   listIssueVotesForUser: vi.fn(async () => []),
   saveIssueVote: vi.fn(async () => ({
@@ -128,6 +244,7 @@ vi.mock("../services/access.js", () => ({
 
 vi.mock("../services/activity-log.js", () => ({
   logActivity: mockLogActivity,
+  redactActivityDetails: async (_db: unknown, details: unknown) => details ?? null,
 }));
 
 vi.mock("../services/agents.js", () => ({
@@ -197,6 +314,21 @@ vi.mock("../services/index.js", () => ({
   issueThreadInteractionService: () => mockIssueThreadInteractionService,
   issueTreeControlService: () => mockIssueTreeControlService,
   logActivity: mockLogActivity,
+  persistActivity: async (db: unknown, input: Record<string, unknown>) => {
+    await mockLogActivity(db, input);
+    return {
+      activity: { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01" },
+      publication: {
+        companyId: typeof input.companyId === "string" ? input.companyId : "company-1",
+        payload: {
+          details: input.details ?? null,
+          responsibleUserId: null,
+        },
+        pluginEvent: null,
+      },
+    };
+  },
+  publishActivity: vi.fn(),
   projectService: () => ({}),
   routineService: () => mockRoutineService,
   workProductService: () => ({}),
@@ -301,12 +433,17 @@ function makeIssueUpdateReceipt(
 }
 
 function agentActor(agentId = "22222222-2222-4222-8222-222222222222") {
+  rememberScopedRun({
+    id: DEFAULT_SCOPED_RUN_ID,
+    companyId: "company-1",
+    agentId,
+  });
   return {
     type: "agent",
     agentId,
     companyId: "company-1",
     source: "agent_key",
-    runId: "run-1",
+    runId: DEFAULT_SCOPED_RUN_ID,
   };
 }
 
@@ -355,23 +492,34 @@ describe.sequential("issue comment reopen routes", () => {
     mockCrossIssueInfluenceRunContextError.mockReset();
     mockTxInsertValues.mockReset();
     mockTxInsert.mockReset();
+    mockDbUpdate.mockReset();
+    mockDbUpdateSet.mockReset();
+    mockDbUpdateWhere.mockReset();
     mockDbSelect.mockReset();
     mockDbSelectFrom.mockReset();
     mockDbSelectWhere.mockReset();
     mockDbSelectOrderBy.mockReset();
     mockDb.transaction.mockReset();
+    clearScopedRuns();
     mockTxInsertValues.mockResolvedValue(undefined);
     mockTxInsert.mockImplementation(() => ({ values: mockTxInsertValues }));
+    mockDbUpdateWhere.mockResolvedValue(undefined);
+    mockDbUpdateSet.mockImplementation(() => ({ where: mockDbUpdateWhere }));
+    mockDbUpdate.mockImplementation(() => ({ set: mockDbUpdateSet }));
     mockDbSelectOrderBy.mockResolvedValue([]);
-    mockDbSelectWhere.mockImplementation(() => ({
-      orderBy: mockDbSelectOrderBy,
-      then: (
-        onFulfilled: (rows: unknown[]) => unknown,
-        onRejected?: (reason: unknown) => unknown,
-      ) => Promise.resolve([]).then(onFulfilled, onRejected),
+    mockDbSelectWhere.mockImplementation(
+      (condition?: unknown, table?: unknown, selection?: unknown) =>
+        selectWhereResult(condition, table, selection),
+    );
+    mockDbSelectFrom.mockImplementation((table?: unknown, selection?: unknown) => ({
+      where: (condition?: unknown) => mockDbSelectWhere(condition, table, selection),
     }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
-    mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
+    mockDbSelect.mockImplementation((selection?: Record<string, unknown>) => ({
+      from: (table?: unknown) => mockDbSelectFrom(table, selection),
+    }));
+    mockTx.select.mockImplementation((selection?: Record<string, unknown>) =>
+      mockDbSelect(selection),
+    );
     mockDb.transaction.mockImplementation(
       async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx),
     );
@@ -1012,12 +1160,17 @@ describe.sequential("issue comment reopen routes", () => {
       }),
     );
 
+    rememberScopedRun({
+      id: ASSIGNEE_SELF_RUN_ID,
+      companyId: "company-1",
+      agentId: assigneeAgentId,
+    });
     const res = await request(
       await installActor(createApp(), {
         type: "agent",
         agentId: assigneeAgentId,
         companyId: "company-1",
-        runId: "run-self",
+        runId: ASSIGNEE_SELF_RUN_ID,
       }),
     )
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
@@ -1057,12 +1210,17 @@ describe.sequential("issue comment reopen routes", () => {
         makeIssueUpdateReceipt(issue, patch),
     );
 
+    rememberScopedRun({
+      id: REASSIGN_RUN_ID,
+      companyId: "company-1",
+      agentId: otherAgentId,
+    });
     const res = await request(
       await installActor(createApp(), {
         type: "agent",
         agentId: otherAgentId,
         companyId: "company-1",
-        runId: "run-other",
+        runId: REASSIGN_RUN_ID,
       }),
     )
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
@@ -1079,18 +1237,14 @@ describe.sequential("issue comment reopen routes", () => {
         assigneeAgentId: otherAgentId,
         status: "todo",
       }),
+      mockTx,
     );
-    expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        action: "issue.updated",
-        details: expect.objectContaining({
-          reopened: true,
-          reopenedFrom: "done",
-          status: "todo",
-        }),
+    expect(mockDbUpdateSet).toHaveBeenCalledWith({
+      details: expect.objectContaining({
+        reopened: true,
+        reopenedFrom: "done",
       }),
-    );
+    });
   });
 
   it("moves assigned blocked issues back to todo via POST comments", async () => {
@@ -1541,7 +1695,7 @@ describe.sequential("issue comment reopen routes", () => {
       {
         agentId: "22222222-2222-4222-8222-222222222222",
         userId: undefined,
-        runId: "run-1",
+        runId: DEFAULT_SCOPED_RUN_ID,
         onBehalfOfUserId: null,
       },
       expect.objectContaining({
@@ -1573,7 +1727,7 @@ describe.sequential("issue comment reopen routes", () => {
       {
         agentId: "22222222-2222-4222-8222-222222222222",
         userId: undefined,
-        runId: "run-1",
+        runId: DEFAULT_SCOPED_RUN_ID,
         onBehalfOfUserId: null,
       },
       expect.objectContaining({ attachmentIds: undefined, presentation: null }),
@@ -1612,7 +1766,7 @@ describe.sequential("issue comment reopen routes", () => {
       {
         agentId: "22222222-2222-4222-8222-222222222222",
         userId: undefined,
-        runId: "run-1",
+        runId: DEFAULT_SCOPED_RUN_ID,
         onBehalfOfUserId: null,
       },
       expect.objectContaining({ attachmentIds: undefined, presentation: null }),
@@ -1851,9 +2005,14 @@ describe.sequential("issue comment reopen routes", () => {
   });
 
   it("does not implicitly reopen done issues via the PATCH comment path when actor runId matches the issue's checkout run", async () => {
+    rememberScopedRun({
+      id: BOARD_OWNING_RUN_ID,
+      companyId: "company-1",
+      agentId: null,
+    });
     const issue = {
       ...makeIssue("done"),
-      checkoutRunId: "run-same-as-actor",
+      checkoutRunId: BOARD_OWNING_RUN_ID,
       executionRunId: null,
     };
     mockIssueService.getById.mockResolvedValue(issue);
@@ -1871,7 +2030,7 @@ describe.sequential("issue comment reopen routes", () => {
         companyIds: ["company-1"],
         source: "local_implicit",
         isInstanceAdmin: false,
-        runId: "run-same-as-actor",
+        runId: BOARD_OWNING_RUN_ID,
       }),
     )
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
@@ -2035,6 +2194,11 @@ describe.sequential("issue comment reopen routes", () => {
       }),
     );
 
+    rememberScopedRun({
+      id: "88888888-8888-4888-8888-888888888888",
+      companyId: "company-1",
+      agentId: "33333333-3333-4333-8333-333333333333",
+    });
     const res = await request(
       await installActor(createApp(), {
         type: "agent",
@@ -2288,6 +2452,7 @@ describe.sequential("issue comment reopen routes", () => {
         actorAgentId: "22222222-2222-4222-8222-222222222222",
         actorUserId: null,
       }),
+      mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -2500,7 +2665,7 @@ describe.sequential("issue comment reopen routes", () => {
         assigneeAgentId: "22222222-2222-4222-8222-222222222222",
       });
       mockHeartbeatService.getRun.mockResolvedValue({
-        id: "run-1",
+        id: DEFAULT_SCOPED_RUN_ID,
         companyId: "company-1",
         agentId: agentA,
         responsibleUserId: null,
@@ -2525,7 +2690,7 @@ describe.sequential("issue comment reopen routes", () => {
       expect(mockObserveCrossIssueInfluence).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({
-          runId: "run-1",
+          runId: DEFAULT_SCOPED_RUN_ID,
           agentId: agentA,
           targetIssueId: "11111111-1111-4111-8111-111111111111",
           kind,
@@ -2675,8 +2840,8 @@ describe.sequential("issue comment reopen routes", () => {
     },
   );
 
-  it.each(["invalid", "wrong agent", "wrong company"])(
-    "rejects comment and PATCH writes with a %s run",
+  it(
+    "rejects comment and PATCH writes when the cross-issue guard refuses the run context",
     async () => {
       mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
       mockObserveCrossIssueInfluence.mockRejectedValue(
@@ -4089,12 +4254,17 @@ describe.sequential("issue comment reopen routes", () => {
       }),
     );
 
+    rememberScopedRun({
+      id: DEFAULT_SCOPED_RUN_ID,
+      companyId: "company-1",
+      agentId: "22222222-2222-4222-8222-222222222222",
+    });
     const res = await request(
       await installActor(createApp(), {
         type: "agent",
         agentId: "22222222-2222-4222-8222-222222222222",
         companyId: "company-1",
-        runId: "run-1",
+        runId: DEFAULT_SCOPED_RUN_ID,
       }),
     )
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
@@ -4195,12 +4365,17 @@ describe.sequential("issue comment reopen routes", () => {
       }),
     );
 
+    rememberScopedRun({
+      id: REVIEWER_RUN_ID,
+      companyId: "company-1",
+      agentId: "33333333-3333-4333-8333-333333333333",
+    });
     const res = await request(
       await installActor(createApp(), {
         type: "agent",
         agentId: "33333333-3333-4333-8333-333333333333",
         companyId: "company-1",
-        runId: "run-2",
+        runId: REVIEWER_RUN_ID,
       }),
     )
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")

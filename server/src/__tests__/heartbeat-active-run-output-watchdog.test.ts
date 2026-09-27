@@ -19,7 +19,9 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { persistActivity, publishActivity } from "../services/activity-log.js";
 import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -32,7 +34,21 @@ vi.mock("../services/heartbeat-run-events.js", async (importOriginal) => {
   return { ...actual, appendHeartbeatRunEvent: vi.fn(actual.appendHeartbeatRunEvent) };
 });
 
+vi.mock("../services/activity-log.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/activity-log.js")>();
+  return {
+    ...actual,
+    persistActivity: vi.fn(actual.persistActivity),
+    publishActivity: vi.fn(actual.publishActivity),
+  };
+});
+
+const activityLogActual = await vi.importActual<typeof import("../services/activity-log.js")>(
+  "../services/activity-log.js",
+);
 const mockedAppendHeartbeatRunEvent = vi.mocked(appendHeartbeatRunEvent);
+const mockedPersistActivity = vi.mocked(persistActivity);
+const mockedPublishActivity = vi.mocked(publishActivity);
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -77,6 +93,10 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
   afterEach(async () => {
     mockedAppendHeartbeatRunEvent.mockClear();
+    mockedPersistActivity.mockReset();
+    mockedPersistActivity.mockImplementation(activityLogActual.persistActivity);
+    mockedPublishActivity.mockReset();
+    mockedPublishActivity.mockImplementation(activityLogActual.publishActivity);
     await truncateCompaniesWithDeadlockRetry(db);
   });
 
@@ -187,6 +207,46 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     }
 
     return { companyId, managerId, coderId, issueId, runId, issuePrefix, startedAt };
+  }
+
+  async function seedCoderOwnedManagerDecision(now: Date) {
+    const seeded = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+    });
+    const evaluationIssueId = randomUUID();
+    const managerRunId = randomUUID();
+    await db.insert(issues).values({
+      id: evaluationIssueId,
+      companyId: seeded.companyId,
+      title: "Manager review of a coder-owned run",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: seeded.managerId,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      originKind: "stale_active_run_evaluation",
+      originId: seeded.runId,
+      originRunId: seeded.runId,
+      originFingerprint: `stale_active_run:${seeded.companyId}:${seeded.runId}`,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: managerRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.managerId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: now,
+      finishedAt: now,
+      processStartedAt: now,
+      lastOutputAt: now,
+      lastOutputSeq: 1,
+      lastOutputStream: "stdout",
+      contextSnapshot: { issueId: evaluationIssueId },
+      logBytes: 0,
+    });
+    return { ...seeded, evaluationIssueId, managerRunId };
   }
 
   function createRecovery() {
@@ -551,6 +611,11 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       reason: "Resolve through the legacy review",
       now,
     })).resolves.toMatchObject({ evaluationIssueId, createdByAgentId: seeded.managerId });
+    const [watchedAfterDecision] = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.runId));
+    expect(watchedAfterDecision?.agentId).toBe(seeded.coderId);
     await expect(recovery.recordWatchdogDecision({
       runId: seeded.runId,
       actor: { type: "agent", agentId: randomUUID() },
@@ -559,6 +624,165 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       reason: "Not assigned",
       now,
     })).rejects.toMatchObject({ status: 403 });
+  });
+
+  it("records one watched-run activity when the recovery manager owns a different run", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const seeded = await seedCoderOwnedManagerDecision(now);
+    const { recovery } = createRecovery();
+    const published: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const unsubscribe = subscribeCompanyLiveEvents(seeded.companyId, (event) => {
+      published.push({ type: event.type, payload: event.payload ?? {} });
+    });
+
+    try {
+      await expect(recovery.recordWatchdogDecision({
+        runId: seeded.runId,
+        actor: { type: "agent", agentId: seeded.managerId, runId: seeded.managerRunId },
+        decision: "continue",
+        evaluationIssueId: seeded.evaluationIssueId,
+        reason: "Coder is still making progress",
+        now,
+      })).resolves.toMatchObject({
+        runId: seeded.runId,
+        evaluationIssueId: seeded.evaluationIssueId,
+        decision: "continue",
+        createdByAgentId: seeded.managerId,
+        createdByUserId: null,
+        createdByRunId: seeded.managerRunId,
+      });
+    } finally {
+      unsubscribe();
+    }
+
+    const [watched] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    const [creator] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.managerRunId));
+    expect(watched?.agentId).toBe(seeded.coderId);
+    expect(creator?.agentId).toBe(seeded.managerId);
+    expect(seeded.managerRunId).not.toBe(seeded.runId);
+
+    const decisions = await db.select().from(heartbeatRunWatchdogDecisions).where(eq(
+      heartbeatRunWatchdogDecisions.runId,
+      seeded.runId,
+    ));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      companyId: seeded.companyId,
+      runId: seeded.runId,
+      decision: "continue",
+      createdByAgentId: seeded.managerId,
+      createdByUserId: null,
+      createdByRunId: seeded.managerRunId,
+      snoozedUntil: new Date(now.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS),
+    });
+
+    const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, seeded.companyId));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]).toMatchObject({
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      action: "heartbeat.watchdog_decision_recorded",
+      entityType: "heartbeat_run",
+      entityId: seeded.runId,
+      runId: seeded.runId,
+      details: {
+        source: "recovery.record_watchdog_decision",
+        decision: "continue",
+        evaluationIssueId: seeded.evaluationIssueId,
+        reason: "Coder is still making progress",
+        recoveryActorType: "agent",
+        createdByAgentId: seeded.managerId,
+        createdByUserId: null,
+        createdByRunId: seeded.managerRunId,
+        snoozedUntil: new Date(now.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS).toISOString(),
+      },
+    });
+    expect(published).toEqual([
+      expect.objectContaining({
+        type: "activity.logged",
+        payload: expect.objectContaining({
+          actorType: "system",
+          actorId: "system",
+          action: "heartbeat.watchdog_decision_recorded",
+          entityType: "heartbeat_run",
+          entityId: seeded.runId,
+          runId: seeded.runId,
+        }),
+      }),
+    ]);
+  });
+
+  it("rolls back the decision and skips publication when activity insertion fails", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const seeded = await seedCoderOwnedManagerDecision(now);
+    const { recovery } = createRecovery();
+    const published: string[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(seeded.companyId, (event) => {
+      published.push(event.type);
+    });
+    mockedPersistActivity.mockImplementationOnce(async (executor, input) => {
+      await activityLogActual.persistActivity(executor, input);
+      throw new Error("injected activity insert fault");
+    });
+
+    try {
+      await expect(recovery.recordWatchdogDecision({
+        runId: seeded.runId,
+        actor: { type: "agent", agentId: seeded.managerId, runId: seeded.managerRunId },
+        decision: "continue",
+        evaluationIssueId: seeded.evaluationIssueId,
+        reason: "Coder is still making progress",
+        now,
+      })).rejects.toThrow("injected activity insert fault");
+    } finally {
+      unsubscribe();
+    }
+
+    expect(published).toEqual([]);
+    expect(mockedPublishActivity).not.toHaveBeenCalled();
+    const [watched] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(watched?.agentId).toBe(seeded.coderId);
+    expect(await db.select().from(heartbeatRunWatchdogDecisions).where(eq(
+      heartbeatRunWatchdogDecisions.companyId,
+      seeded.companyId,
+    ))).toHaveLength(0);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, seeded.companyId))).toHaveLength(0);
+  });
+
+  it("returns the committed decision when activity publication throws", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const seeded = await seedCoderOwnedManagerDecision(now);
+    const { recovery } = createRecovery();
+    mockedPublishActivity.mockImplementationOnce(() => {
+      throw new Error("injected publication fault");
+    });
+
+    await expect(recovery.recordWatchdogDecision({
+      runId: seeded.runId,
+      actor: { type: "agent", agentId: seeded.managerId, runId: seeded.managerRunId },
+      decision: "continue",
+      evaluationIssueId: seeded.evaluationIssueId,
+      reason: "Coder is still making progress",
+      now,
+    })).resolves.toMatchObject({
+      runId: seeded.runId,
+      createdByAgentId: seeded.managerId,
+      createdByRunId: seeded.managerRunId,
+    });
+
+    expect(await db.select().from(heartbeatRunWatchdogDecisions).where(eq(
+      heartbeatRunWatchdogDecisions.runId,
+      seeded.runId,
+    ))).toHaveLength(1);
+    const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, seeded.companyId));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]).toMatchObject({
+      runId: seeded.runId,
+      entityId: seeded.runId,
+      actorType: "system",
+    });
   });
 
   it("does not recreate or auto-dismiss a closed legacy evaluation", async () => {

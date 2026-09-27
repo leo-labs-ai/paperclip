@@ -15,6 +15,10 @@ import {
   redactSensitive,
   stripSecretBearingUrlParts,
 } from "./redact-sensitive.js";
+import {
+  redactDatabaseFaultText,
+  serializeErrorWithoutDatabaseQuery,
+} from "./redact-db-fault.js";
 
 const sharedOpts = {
   translateTime: "SYS:HH:MM:ss",
@@ -45,8 +49,10 @@ const loggerOptions = {
   // message string. Covers both the conventional `err` key and the
   // `error` key some call sites use.
   serializers: {
-    err: pino.stdSerializers.errWithCause,
-    error: pino.stdSerializers.errWithCause,
+    // Keep the cause chain (code, constraint) but drop Drizzle query text and
+    // bind parameters. Issue #84 leaked both on an unknown run id.
+    err: serializeErrorWithoutDatabaseQuery,
+    error: serializeErrorWithoutDatabaseQuery,
   },
 };
 
@@ -166,11 +172,12 @@ export function createHttpLogger(baseLogger: Logger) {
         return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`;
       }
       const ctx = (res as any).__errorContext;
-      const errMsg =
+      const errMsg = redactDatabaseFaultText(
         ctx?.error?.message ||
-        err?.message ||
-        (res as any).err?.message ||
-        "unknown error";
+          err?.message ||
+          (res as any).err?.message ||
+          "unknown error",
+      );
       return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${errMsg}`;
     },
     customErrorObject(req, _res, _err, value) {
