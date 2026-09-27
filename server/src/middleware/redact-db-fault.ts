@@ -86,9 +86,16 @@ function graphHasQueryLeak(value: unknown, depth: number, seen: WeakSet<object>)
       if (DROPPED_DATABASE_KEYS.has(key)) return true;
       if (graphHasQueryLeak(entry, depth + 1, seen)) return true;
     }
+    // `new Error(message, { cause })` stores cause as an own non-enumerable
+    // property. Object.entries skips it, and hasOwnProperty is still true, so
+    // the leak check has to read `.cause` itself.
     const cause = (value as { cause?: unknown }).cause;
-    if (cause !== undefined && !Object.prototype.hasOwnProperty.call(value, "cause")) {
-      return graphHasQueryLeak(cause, depth + 1, seen);
+    if (
+      cause !== undefined &&
+      !Object.prototype.propertyIsEnumerable.call(value, "cause") &&
+      graphHasQueryLeak(cause, depth + 1, seen)
+    ) {
+      return true;
     }
     return false;
   } finally {
