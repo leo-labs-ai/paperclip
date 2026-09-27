@@ -107,6 +107,15 @@ describe("unknown run id contract", () => {
     expect(JSON.stringify(safe)).not.toContain(SQL_CANARY);
     expect(JSON.stringify(safe)).not.toContain(PARAM_CANARY);
 
+    const wrapped = new Error("pool exhausted", { cause: drizzleFault() });
+    const wrappedSafe = databaseFaultForClient(wrapped);
+    expect(wrappedSafe).not.toBe(wrapped);
+    expect(wrappedSafe.message).toBe("pool exhausted");
+    expect(JSON.stringify(wrappedSafe)).not.toContain(SQL_CANARY);
+    expect(JSON.stringify(wrappedSafe)).not.toContain(PARAM_CANARY);
+    expect(JSON.stringify(wrappedSafe.cause)).toContain("23503");
+    expect(JSON.stringify(wrappedSafe.cause)).toContain("issues_checkout_run_id_heartbeat_runs_id_fk");
+
     const operational = Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
     expect(databaseFaultForClient(operational)).toBe(operational);
     expect(JSON.stringify(serializeErrorWithoutDatabaseQuery(operational))).toContain("connection refused");
