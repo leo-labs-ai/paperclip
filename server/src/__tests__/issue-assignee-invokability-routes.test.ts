@@ -1,5 +1,7 @@
 import express from "express";
 import request from "supertest";
+import { getTableName, type SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const AGENT_ACTOR_ID = "11111111-1111-4111-8111-111111111111";
@@ -47,7 +49,9 @@ vi.mock("../services/cross-issue-influence-limit.js", async (importOriginal) => 
   observeCrossIssueInfluence: mockObserveCrossIssueInfluence,
 }));
 
-vi.mock("../services/index.js", () => ({
+vi.mock("../services/index.js", async () => {
+  const activity = await import("../services/activity-log.js");
+  return {
   companyService: () => ({
     getById: vi.fn(async () => ({ id: "company-1" })),
   }),
@@ -124,12 +128,14 @@ vi.mock("../services/index.js", () => ({
     expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(async () => []),
   }),
   logActivity: vi.fn(async () => undefined),
+  persistActivity: activity.persistActivity,
+  publishActivity: activity.publishActivity,
   projectService: () => ({}),
   routineService: () => ({
     syncRunStatusForIssue: vi.fn(async () => undefined),
   }),
   workProductService: () => ({}),
-}));
+}; });
 
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -156,15 +162,69 @@ function agentActor(): Actor {
   };
 }
 
-// Minimal chainable/thenable db stub: any query resolves to an empty row set.
-// Run containment is mocked because this suite targets assignee invokability.
+const SCOPED_RUN = {
+  id: AGENT_RUN_ID,
+  companyId: "company-1",
+  agentId: AGENT_ACTOR_ID,
+};
+
+// Chain matches assert/lock (`where` → optional `for` → `limit(1)`) and
+// activity insert (`values().returning({ id })`). Heartbeat-run reads return
+// the seeded company+agent run only when the predicate binds all three.
 function stubDb(): any {
+  const dialect = new PgDialect();
+  let heartbeatRunQuery = false;
+  let scopeMatched = false;
   const query: any = {};
-  for (const method of ["select", "from", "where", "innerJoin", "leftJoin", "orderBy", "limit", "groupBy", "for"]) {
+  const rows = () => (heartbeatRunQuery && scopeMatched ? [{ id: SCOPED_RUN.id }] : []);
+  for (const method of ["innerJoin", "leftJoin", "orderBy", "groupBy", "limit", "for"]) {
     query[method] = () => query;
   }
-  query.then = (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([]));
-  return { select: () => query };
+  query.from = (table: Parameters<typeof getTableName>[0]) => {
+    heartbeatRunQuery = getTableName(table) === "heartbeat_runs";
+    scopeMatched = false;
+    return query;
+  };
+  query.where = (condition: SQL) => {
+    if (heartbeatRunQuery) {
+      const params = dialect.sqlToQuery(condition).params.map((value) => String(value));
+      scopeMatched = params.includes(SCOPED_RUN.id)
+        && params.includes(SCOPED_RUN.companyId)
+        && params.includes(SCOPED_RUN.agentId);
+    }
+    return query;
+  };
+  query.then = (
+    resolve: (selected: unknown[]) => unknown,
+    reject?: (reason: unknown) => unknown,
+  ) => Promise.resolve(rows()).then(resolve, reject);
+  const inserted = () => {
+    const pending = Promise.resolve(undefined);
+    return Object.assign(pending, {
+      returning: () => Promise.resolve([{ id: "77777777-7777-4777-8777-777777777777" }]),
+      onConflictDoNothing: () => ({ returning: () => Promise.resolve([]) }),
+      onConflictDoUpdate: () => ({
+        returning: () => Promise.resolve([{
+          id: "instance-settings-1",
+          general: {},
+          experimental: {},
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }]),
+      }),
+    });
+  };
+  const db = {
+    select: () => {
+      heartbeatRunQuery = false;
+      scopeMatched = false;
+      return query;
+    },
+    insert: () => ({ values: () => inserted() }),
+    update: () => ({ set: () => ({ where: () => Promise.resolve(undefined) }) }),
+    transaction: (callback: (tx: typeof db) => Promise<unknown>) => callback(db),
+  };
+  return db;
 }
 
 function createApp(actor: Actor) {
@@ -257,6 +317,24 @@ describe("issue assignee invokability guard", () => {
 
     expect(res.status).toBe(200);
     expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("returns 422 unknown_run_id when the agent run is not the scoped company row", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue());
+
+    const res = await request(createApp({
+      ...agentActor(),
+      runId: "99999999-9999-4999-8999-999999999999",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ title: "Renamed without that run" });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({
+      error: "unknown_run_id",
+      details: { code: "unknown_run_id", source: "header" },
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("allows a board user to assign to a paused agent deliberately", async () => {

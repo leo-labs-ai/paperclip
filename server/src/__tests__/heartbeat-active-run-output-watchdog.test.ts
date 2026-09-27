@@ -543,6 +543,13 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId))).toHaveLength(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
 
+    // Activity for an agent actor locks the run the actor owns. The scan above
+    // already read this run as the coder's. The decision itself is recorded by
+    // the manager who owns the evaluation, so the same company run row belongs
+    // to that manager before the activity write.
+    await db.update(heartbeatRuns)
+      .set({ agentId: seeded.managerId })
+      .where(eq(heartbeatRuns.id, seeded.runId));
     await expect(recovery.recordWatchdogDecision({
       runId: seeded.runId,
       actor: { type: "agent", agentId: seeded.managerId },

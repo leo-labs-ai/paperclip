@@ -11,6 +11,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
   issueComments,
@@ -53,6 +54,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     await db.delete(issueComments);
     await db.delete(issueRecoveryActions);
     await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueInboxArchives);
@@ -314,7 +316,17 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       details: { status: "in_review", _previous: { status: "in_progress" } },
     });
 
-    const requesterVerdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId)))
+    const missingRunVerdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+    expect(missingRunVerdict.status).toBe(422);
+    expect(missingRunVerdict.body).toMatchObject({
+      error: "unknown_run_id",
+      details: { code: "unknown_run_id", source: "header" },
+    });
+
+    const requesterRunId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    const requesterVerdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, requesterRunId)))
       .patch(`/api/issues/${issueId}`)
       .send({ status: "done" });
     expect(requesterVerdict.status).toBe(403);
@@ -345,7 +357,17 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       reviewPolicy: "human_only",
     });
 
-    const agentVerdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId)))
+    const missingRunVerdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "cancelled" });
+    expect(missingRunVerdict.status).toBe(422);
+    expect(missingRunVerdict.body).toMatchObject({
+      error: "unknown_run_id",
+      details: { code: "unknown_run_id", source: "header" },
+    });
+
+    const agentRunId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    const agentVerdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, agentRunId)))
       .patch(`/api/issues/${issueId}`)
       .send({ status: "cancelled" });
     expect(agentVerdict.status).toBe(403);

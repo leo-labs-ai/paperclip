@@ -195,9 +195,13 @@ function registerRouteMocks() {
     externalObjectService: () => mockExternalObjectService,
   }));
 
-  vi.doMock("../services/activity-log.js", () => ({
-    logActivity: mockLogActivity,
-  }));
+  vi.doMock("../services/activity-log.js", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("../services/activity-log.js")>();
+    return {
+      ...actual,
+      logActivity: mockLogActivity,
+    };
+  });
 
   vi.doMock("../services/cross-issue-influence-limit.js", () => ({
     observeCrossIssueInfluence: mockObserveCrossIssueInfluence,
@@ -215,7 +219,9 @@ function registerRouteMocks() {
     RunnerGoalConflictError: class RunnerGoalConflictError extends Error {},
   }));
 
-  vi.doMock("../services/index.js", () => ({
+  vi.doMock("../services/index.js", async () => {
+    const activity = await import("../services/activity-log.js");
+    return {
     ISSUE_LIST_DEFAULT_LIMIT: 100,
     ISSUE_LIST_MAX_LIMIT: 500,
     accessService: () => mockAccessService,
@@ -273,12 +279,15 @@ function registerRouteMocks() {
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     taskWatchdogService: () => mockTaskWatchdogService,
     logActivity: mockLogActivity,
+    persistActivity: activity.persistActivity,
+    publishActivity: activity.publishActivity,
     projectService: () => mockProjectService,
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
     workProductService: () => mockWorkProductService,
-  }));
+  };
+  });
 }
 
 function makeIssue(overrides: Record<string, unknown> = {}) {
@@ -334,12 +343,32 @@ function createRunContextDb(
   const firstRun = runRows[0] ?? {};
   const runAgentId = typeof firstRun.agentId === "string" ? firstRun.agentId : ownerAgentId;
   const runAgentCompanyId = typeof firstRun.agentCompanyId === "string" ? firstRun.agentCompanyId : companyId;
-  const rowsForSelection = async (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false) => {
+  const rowsForSelection = async (
+    selection: Record<string, unknown>,
+    chatBindingQuery = false,
+    settledRecoveryQuery = false,
+    heartbeatRunQuery = false,
+    whereParams: string[] = [],
+  ) => {
     if (chatBindingQuery) return chatBindings;
     // An unknown selector has no settled recovery receipt. Returning the
     // generic issue fixture here would invent an unrelated replay row.
     if (settledRecoveryQuery) return [];
     const keys = Object.keys(selection);
+    // Scope checks select only the run id, then `.for("key share").limit(1)`.
+    // A row is visible only when the predicate binds that run, its company,
+    // and its agent when an agent predicate is present.
+    if (heartbeatRunQuery && keys.length === 1 && keys[0] === "id") {
+      return runRows.filter((row) => {
+        const rowId = typeof row.id === "string" ? row.id : "";
+        const rowCompanyId = typeof row.companyId === "string" ? row.companyId : "";
+        const rowAgentId = typeof row.agentId === "string" ? row.agentId : "";
+        if (!whereParams.includes(rowId) || !whereParams.includes(rowCompanyId)) return false;
+        const agentIds = [ownerAgentId, peerAgentId, rowAgentId].filter((value) => value.length > 0);
+        const bindsAgent = agentIds.some((agentId) => whereParams.includes(agentId));
+        return !bindsAgent || (rowAgentId.length > 0 && whereParams.includes(rowAgentId));
+      });
+    }
     if (keys.includes("entityId")) return [];
     if (keys.includes("contextSnapshot")) return runRows;
     if (keys.includes("agentCompanyId")) return runRows;
@@ -349,21 +378,38 @@ function createRunContextDb(
     }
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
   };
-  const buildQuery = (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false) => {
+  const buildQuery = (
+    selection: Record<string, unknown>,
+    chatBindingQuery = false,
+    settledRecoveryQuery = false,
+    heartbeatRunQuery = false,
+  ) => {
+    const whereParams: string[] = [];
+    const resolveRows = () => rowsForSelection(
+      selection,
+      chatBindingQuery,
+      settledRecoveryQuery,
+      heartbeatRunQuery,
+      whereParams,
+    );
+    const limited = () => ({
+      then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(await resolveRows()),
+    });
     const whereResult = {
       orderBy: vi.fn(async () => []),
-      limit: vi.fn(() => ({
-        then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery)),
-      })),
+      limit: vi.fn(() => limited()),
       for: vi.fn(() => ({
-        then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery)),
+        limit: vi.fn(() => limited()),
+        then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await resolveRows()),
       })),
-      then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery)),
+      then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await resolveRows()),
     };
     const query = {
       innerJoin: vi.fn(() => query),
       where: vi.fn((condition: SQL) => {
-        if (chatBindingQuery) chatBindingQueries.push(new PgDialect().sqlToQuery(condition));
+        const compiled = new PgDialect().sqlToQuery(condition);
+        if (chatBindingQuery) chatBindingQueries.push(compiled);
+        whereParams.splice(0, whereParams.length, ...compiled.params.map((value) => String(value)));
         return whereResult;
       }),
     };
@@ -373,10 +419,39 @@ function createRunContextDb(
     chatBindingQueries,
     transaction: async (callback: (tx: typeof dbStub) => Promise<unknown>) => callback(dbStub),
     select: vi.fn((selection: Record<string, unknown> = {}) => ({
-      from: vi.fn((table: Parameters<typeof getTableName>[0]) =>
-        buildQuery(selection, getTableName(table) === "chat_conversations", getTableName(table) === "issue_recovery_actions")),
+      from: vi.fn((table: Parameters<typeof getTableName>[0]) => {
+        const tableName = getTableName(table);
+        return buildQuery(
+          selection,
+          tableName === "chat_conversations",
+          tableName === "issue_recovery_actions",
+          tableName === "heartbeat_runs",
+        );
+      }),
     })),
-    insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+    insert: vi.fn(() => ({
+      values: vi.fn(() => {
+        const pending = Promise.resolve(undefined);
+        return Object.assign(pending, {
+          returning: vi.fn(async () => [{ id: "88888888-8888-4888-8888-888888888888" }]),
+          onConflictDoNothing: vi.fn(() => ({ returning: vi.fn(async () => []) })),
+          onConflictDoUpdate: vi.fn(() => ({
+            returning: vi.fn(async () => [{
+              id: "instance-settings-1",
+              general: {},
+              experimental: {},
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            }]),
+          })),
+        });
+      }),
+    })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => Promise.resolve(undefined)),
+      })),
+    })),
   };
   return dbStub;
 }
@@ -769,6 +844,24 @@ describe("agent issue mutation checkout ownership", () => {
       contentLength: 6,
     });
     mockStorageService.deleteObject.mockResolvedValue(undefined);
+  });
+
+  it("returns 422 unknown_run_id when the agent run is not the scoped company row", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue());
+    const missingRunId = "99999999-9999-4999-8999-999999999999";
+    const res = await request(await createApp(
+      { ...ownerActor(), runId: missingRunId },
+      createRunContextDb({}, ownerAgentId, ownerRunId),
+    ))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Renamed without that run" });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({
+      error: "unknown_run_id",
+      details: { code: "unknown_run_id", source: "header" },
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("denies company-wide issue list routes for task bridge keys", async () => {
@@ -1595,6 +1688,7 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).toHaveBeenCalledWith(
       issueId,
       expect.objectContaining({ title: "Updated after commit" }),
+      expect.anything(),
     );
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       issueId,
@@ -2580,10 +2674,15 @@ describe("agent issue mutation checkout ownership", () => {
       };
       const buildQuery = (selection: Record<string, unknown>) => {
         const rows = rowsForSelection(selection);
+        const limited = () => ({
+          then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(rows),
+        });
         const whereResult = {
           orderBy: vi.fn(async () => []),
-          limit: vi.fn(() => ({
-            then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(rows),
+          limit: vi.fn(() => limited()),
+          for: vi.fn(() => ({
+            limit: vi.fn(() => limited()),
+            then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(rows),
           })),
           then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(rows),
         };
@@ -2593,12 +2692,26 @@ describe("agent issue mutation checkout ownership", () => {
         };
         return query;
       };
-      return {
-        transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
+      const db = {
+        transaction: async (callback: (tx: typeof db) => Promise<unknown>) => callback(db),
         select: vi.fn((selection: Record<string, unknown> = {}) => ({
           from: vi.fn(() => buildQuery(selection)),
         })),
+        insert: vi.fn(() => ({
+          values: vi.fn(() => {
+            const pending = Promise.resolve(undefined);
+            return Object.assign(pending, {
+              returning: vi.fn(async () => [{ id: "88888888-8888-4888-8888-888888888888" }]),
+            });
+          }),
+        })),
+        update: vi.fn(() => ({
+          set: vi.fn(() => ({
+            where: vi.fn(() => Promise.resolve(undefined)),
+          })),
+        })),
       };
+      return db;
     }
 
     // The base boundary always denies a cross-agent issue:mutate; only the
@@ -2648,7 +2761,11 @@ describe("agent issue mutation checkout ownership", () => {
       const res = await request(app).patch(`/api/issues/${issueId}`).send({ status });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(mockIssueService.update).toHaveBeenCalledWith(issueId, expect.objectContaining({ status }));
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status }),
+        expect.anything(),
+      );
     });
 
     it("lets a watchdog run transition a watched issue to in_review with a live review path", async () => {
@@ -2833,6 +2950,7 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).toHaveBeenCalledWith(
         issueId,
         expect.objectContaining({ assigneeAgentId: peerAgentId }),
+        expect.anything(),
       );
     });
 
