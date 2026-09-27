@@ -16,30 +16,41 @@ const mockAgentService = vi.hoisted(() => ({
 
 const mockTrackAgentTaskCompleted = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
-const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
-  for: () => ({
-    then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-      Promise.resolve([{
-        id: "22222222-2222-4222-8222-222222222222",
-        companyId: "company-1",
-        agentId: "agent-1",
-        contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
-        permissions: null,
-      }]).then(onFulfilled, onRejected),
-  }),
-  then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-    Promise.resolve([{
-      id: "22222222-2222-4222-8222-222222222222",
-      companyId: "company-1",
-      agentId: "agent-1",
-      contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
-      permissions: null,
-    }]).then(onFulfilled, onRejected),
-})));
+const scopedHeartbeatRunRow = {
+  id: "22222222-2222-4222-8222-222222222222",
+  companyId: "company-1",
+  agentId: "agent-1",
+  contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
+  permissions: null,
+};
+
+// Production scope checks are `.where().limit(1)` and `.where().for("key share").limit(1)`.
+function scopedHeartbeatRunQuery() {
+  const fulfill = (
+    onFulfilled: (rows: unknown[]) => unknown,
+    onRejected?: (reason: unknown) => unknown,
+  ) => Promise.resolve([scopedHeartbeatRunRow]).then(onFulfilled, onRejected);
+  const limited = { then: fulfill };
+  return {
+    limit: () => limited,
+    for: () => ({
+      limit: () => limited,
+      then: fulfill,
+    }),
+    then: fulfill,
+  };
+}
+
+const mockDbSelectWhere = vi.hoisted(() => vi.fn());
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
+  update: vi.fn(() => ({
+    set: () => ({
+      where: () => Promise.resolve(undefined),
+    }),
+  })),
   transaction: vi.fn(async (callback: (tx: { select: typeof mockDbSelect }) => Promise<unknown>) =>
     callback({ select: mockDbSelect })),
 }));
@@ -49,6 +60,19 @@ const mockRunnerGoalService = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/activity-log.js", async () => {
+    const actual = await vi.importActual<typeof import("../services/activity-log.js")>(
+      "../services/activity-log.js",
+    );
+    return {
+      ...actual,
+      redactActivityDetails: async (
+        _db: unknown,
+        details: Record<string, unknown> | null,
+      ) => details,
+    };
+  });
+
   vi.doMock("@paperclipai/shared/telemetry", () => ({
     trackAgentTaskCompleted: mockTrackAgentTaskCompleted,
     trackErrorHandlerCrash: vi.fn(),
@@ -118,6 +142,18 @@ function registerModuleMocks() {
     }),
     issueService: () => mockIssueService,
     logActivity: vi.fn(async () => undefined),
+    persistActivity: async (_db: unknown, input: { companyId?: string; details?: unknown }) => ({
+      activity: { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01" },
+      publication: {
+        companyId: input.companyId ?? "company-1",
+        payload: {
+          details: input.details ?? null,
+          responsibleUserId: null,
+        },
+        pluginEvent: null,
+      },
+    }),
+    publishActivity: vi.fn(),
     projectService: () => ({}),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
@@ -162,6 +198,7 @@ async function createApp(actor: Record<string, unknown>) {
 describe("issue telemetry routes", () => {
   beforeEach(async () => {
     vi.resetModules();
+    vi.doUnmock("../services/activity-log.js");
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
     vi.doUnmock("../services/index.js");
@@ -181,26 +218,7 @@ describe("issue telemetry routes", () => {
     }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
-    mockDbSelectWhere.mockImplementation(() => ({
-      for: () => ({
-        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-          Promise.resolve([{
-            id: "22222222-2222-4222-8222-222222222222",
-            companyId: "company-1",
-            agentId: "agent-1",
-            contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
-            permissions: null,
-          }]).then(onFulfilled, onRejected),
-      }),
-      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve([{
-          id: "22222222-2222-4222-8222-222222222222",
-          companyId: "company-1",
-          agentId: "agent-1",
-          contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
-          permissions: null,
-        }]).then(onFulfilled, onRejected),
-    }));
+    mockDbSelectWhere.mockImplementation(() => scopedHeartbeatRunQuery());
     // Keep cold route imports in setup rather than the HTTP assertion timeout.
     await loadAppModules();
   }, 60_000);
