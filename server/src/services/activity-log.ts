@@ -10,6 +10,12 @@ import { sanitizeRecord } from "../redaction.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import {
+  isHeartbeatRunReferenceViolation,
+  lockScopedHeartbeatRun,
+  unknownRunIdError,
+} from "./heartbeat-run-scope.js";
+import { HttpError } from "../errors.js";
 
 const PLUGIN_EVENT_SET: ReadonlySet<string> = new Set(PLUGIN_EVENT_TYPES);
 const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>> = {
@@ -160,7 +166,7 @@ export function publishActivity(publication: ActivityPublication) {
 export async function persistActivity(db: Db, input: LogActivityInput) {
   const redactedDetails = await redactActivityDetails(db, input.details ?? null);
   const responsibleUserId = await resolveResponsibleUserIdForActivity(db, input);
-  const [activity] = await db.insert(activityLog).values({
+  const values = {
     companyId: input.companyId,
     actorType: input.actorType,
     actorId: input.actorId,
@@ -171,7 +177,35 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
     runId: input.runId ?? null,
     responsibleUserId,
     details: redactedDetails,
-  }).returning({ id: activityLog.id });
+  };
+  // Company scope is mandatory whenever a run id is written. Agent actors
+  // must also own that run. The lock and insert share a transaction so a
+  // delete or primary-key reuse cannot turn this write into a 500, and an
+  // earlier unlocked check is not treated as sufficient.
+  const insertActivity = async (executor: Db) => {
+    const [row] = await executor.insert(activityLog).values(values).returning({ id: activityLog.id });
+    return row;
+  };
+  let activity: { id: string } | undefined;
+  const runId = input.runId?.trim() || null;
+  if (runId) {
+    try {
+      activity = await db.transaction(async (tx) => {
+        await lockScopedHeartbeatRun(tx, {
+          runId,
+          companyId: input.companyId,
+          agentId: input.actorType === "agent" && input.agentId ? input.agentId : null,
+        });
+        return insertActivity(tx as unknown as Db);
+      });
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      if (isHeartbeatRunReferenceViolation(error)) throw unknownRunIdError();
+      throw error;
+    }
+  } else {
+    activity = await insertActivity(db);
+  }
 
   const payload = {
     actorType: input.actorType,

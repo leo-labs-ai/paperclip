@@ -13,6 +13,10 @@ import {
   redactSensitiveValueOccurrences,
 } from "./redact-sensitive.js";
 import { recordResponsibleUserDenialOnActiveRun } from "../services/responsible-user-denial-run-outcomes.js";
+import {
+  databaseFaultForClient,
+  redactDatabaseFaultText,
+} from "./redact-db-fault.js";
 
 export interface ErrorContext {
   error: {
@@ -162,15 +166,15 @@ export function errorHandler(
         : null;
     recordResponsibleUserDenialFromHttpError(req, details);
     if (err.status >= 500) {
-      const reportableError = sanitizeSecretSensitiveError(req, err);
+      const reportableError = databaseFaultForClient(sanitizeSecretSensitiveError(req, err));
       attachErrorContext(
         req,
         res,
         isSecretSensitiveHttpRequest(req.method, req.originalUrl)
           ? { message: reportableError.message, name: reportableError.name }
           : {
-              message: err.message,
-              stack: err.stack,
+              message: redactDatabaseFaultText(err.message),
+              stack: err.stack ? redactDatabaseFaultText(err.stack) : undefined,
               name: err.name,
               details: err.details,
             },
@@ -185,7 +189,7 @@ export function errorHandler(
       secretSensitiveServerError
         ? { error: "Internal server error" }
         : {
-            error: sanitizeSecretSensitiveResponse(req, err.message),
+            error: sanitizeSecretSensitiveResponse(req, redactDatabaseFaultText(err.message)),
             ...(typeof responseDetails?.code === "string"
               ? { code: responseDetails.code }
               : {}),
@@ -236,7 +240,7 @@ export function errorHandler(
     return;
   }
 
-  const rootError = err instanceof Error ? err : new Error(String(err));
+  const rootError = databaseFaultForClient(err instanceof Error ? err : new Error(String(err)));
 
   // The client tore down the connection mid-request (closed tab, dropped
   // mobile network, cancelled upload): Node surfaces it as `Error: aborted`
@@ -258,10 +262,9 @@ export function errorHandler(
     isSecretSensitiveHttpRequest(req.method, req.originalUrl)
       ? { message: reportableError.message, name: reportableError.name }
       : err instanceof Error
-        ? { message: err.message, stack: err.stack, name: err.name }
+        ? { message: redactDatabaseFaultText(err.message), stack: err.stack ? redactDatabaseFaultText(err.stack) : undefined, name: err.name }
         : {
-            message: String(err),
-            raw: err,
+            message: redactDatabaseFaultText(String(err)),
             stack: rootError.stack,
             name: rootError.name,
           },
@@ -273,7 +276,7 @@ export function errorHandler(
   res.status(500).json({
     error: "Internal server error",
     ...(shouldExposeTrustedCloudTenantImportError(req)
-      ? { message: rootError.message }
+      ? { message: redactDatabaseFaultText(rootError.message) }
       : {}),
   });
 }

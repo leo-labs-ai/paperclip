@@ -236,6 +236,7 @@ import {
   collectIssueWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
+import { assertScopedHeartbeatRun } from "../services/heartbeat-run-scope.js";
 import {
   formatAttachmentSize,
   GENERIC_ATTACHMENT_CONTENT_TYPES,
@@ -12753,6 +12754,13 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!existing) return;
+      // Fail closed before mutation. A well-formed run id that is missing, in
+      // another company, or owned by another agent must not reach activity_log.
+      await assertScopedHeartbeatRun(db, {
+        runId: req.actor.runId,
+        companyId: existing.companyId,
+        agentId: req.actor.type === "agent" ? (req.actor.agentId ?? "") : null,
+      });
       assertNoAgentHostWorkspaceCommandMutation(
         req,
         collectIssueWorkspaceCommandPaths(req.body),
@@ -15054,6 +15062,14 @@ export function issueRoutes(
 
       const checkoutRunId = requireAgentRunId(req, res);
       if (req.actor.type === "agent" && !checkoutRunId) return;
+      // Existence and company/agent scope, before workspace reopen. The
+      // checkout write locks the same scope; this gate stops the reopen side
+      // effect. A later delete is a 422, not a 500.
+      await assertScopedHeartbeatRun(db, {
+        runId: checkoutRunId,
+        companyId: issue.companyId,
+        agentId: req.actor.type === "agent" ? (req.actor.agentId ?? "") : req.body.agentId,
+      });
 
       // Reopen the closed isolated workspace only after the run-id gate passes. A
       // rejected checkout must not rebuild and republish the workspace as active.
