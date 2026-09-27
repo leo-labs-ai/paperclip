@@ -12760,6 +12760,15 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!existing) return;
+      // Host-command authorization is a pure request check. It stays ahead of
+      // the run lookup so an agent key that is not allowed to set a provision
+      // or teardown command is rejected with 403 even when the run id is also
+      // missing, malformed, or deleted. Callers who may send the field still
+      // fail closed on the run check below.
+      assertNoAgentHostWorkspaceCommandMutation(
+        req,
+        collectIssueWorkspaceCommandPaths(req.body),
+      );
       // Fail closed before mutation. A well-formed run id that is missing, in
       // another company, or owned by another agent must not reach activity_log.
       await assertScopedHeartbeatRun(db, {
@@ -12767,10 +12776,6 @@ export function issueRoutes(
         companyId: existing.companyId,
         agentId: req.actor.type === "agent" ? (req.actor.agentId ?? "") : null,
       });
-      assertNoAgentHostWorkspaceCommandMutation(
-        req,
-        collectIssueWorkspaceCommandPaths(req.body),
-      );
       if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
         await auditAgentIssueCommentAttributionSpoof({
           db,

@@ -53,13 +53,26 @@ const mockRoutineService = vi.hoisted(() => ({
   syncRunStatusForIssue: vi.fn(),
 }));
 
-const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
-  then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-    Promise.resolve([{ companyId: "company-1", agentId: "agent-1", contextSnapshot: null }]).then(
-      onFulfilled,
-      onRejected,
-    ),
-})));
+const FOUND_SCOPED_RUN = [{ companyId: "company-1", agentId: "agent-1", contextSnapshot: null }];
+
+function scopedRunQuery(rows: unknown[]) {
+  const query = {
+    limit: () => query,
+    then: (onFulfilled: (value: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve(rows).then(onFulfilled, onRejected),
+  };
+  return query;
+}
+
+const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => {
+  const rows = [{ companyId: "company-1", agentId: "agent-1", contextSnapshot: null }];
+  const query = {
+    limit: () => query,
+    then: (onFulfilled: (value: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve(rows).then(onFulfilled, onRejected),
+  };
+  return query;
+}));
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 const mockDb = vi.hoisted(() => ({
@@ -254,13 +267,7 @@ describe("issue workspace command authorization", () => {
     mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
-    mockDbSelectWhere.mockImplementation(() => ({
-      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve([{ companyId: "company-1", agentId: "agent-1", contextSnapshot: null }]).then(
-          onFulfilled,
-          onRejected,
-        ),
-    }));
+    mockDbSelectWhere.mockImplementation(() => scopedRunQuery(FOUND_SCOPED_RUN));
   });
 
   it("rejects agent callers that create issue workspace runtime provision commands", async () => {
@@ -314,6 +321,61 @@ describe("issue workspace command authorization", () => {
 
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("host-executed workspace commands");
+    expect(res.body.error).not.toContain("unknown_run_id");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("returns 403 for an agent teardown patch before unknown_run_id, and 422 for an authorized field", async () => {
+    const missingRunId = "d26b3c44-1111-4111-8111-111111111111";
+    mockDbSelectWhere.mockImplementation(() => scopedRunQuery([]));
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: missingRunId,
+    });
+
+    const forbidden = await request(app)
+      .patch("/api/issues/issue-1")
+      .send({
+        assigneeAdapterOverrides: {
+          adapterConfig: {
+            workspaceStrategy: {
+              type: "git_worktree",
+              teardownCommand: "rm -rf /tmp/paperclip-rce",
+            },
+          },
+        },
+      });
+
+    expect(forbidden.status).toBe(403);
+    expect(forbidden.body.error).toContain("host-executed workspace commands");
+    expect(JSON.stringify(forbidden.body)).not.toContain("unknown_run_id");
+
+    const missingRun = await request(app)
+      .patch("/api/issues/issue-1")
+      .send({ title: "should-not-stick" });
+
+    expect(missingRun.status).toBe(422);
+    expect(missingRun.body).toMatchObject({
+      error: "unknown_run_id",
+      code: "unknown_run_id",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    const malformed = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    });
+    const authorizedField = await request(malformed)
+      .patch("/api/issues/issue-1")
+      .send({ title: "malformed-run" });
+    expect(authorizedField.status).toBe(422);
+    expect(authorizedField.body.error).toBe("unknown_run_id");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 });

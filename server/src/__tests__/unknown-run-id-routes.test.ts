@@ -121,6 +121,71 @@ describeEmbeddedPostgres("unknown X-Paperclip-Run-Id on checkout and PATCH", () 
     expect(serialized).not.toContain("insert ");
   }
 
+  const teardownPatch = {
+    assigneeAdapterOverrides: {
+      adapterConfig: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          teardownCommand: "rm -rf /tmp/paperclip-rce",
+        },
+      },
+    },
+  };
+
+  it("prefers 403 for an agent host-command patch and keeps 422 for an authorized field", async () => {
+    const company = await seedCompanyWithBoardAccess(ctx.db, "Home");
+    const agentId = await seedAgent(company.companyId, "Home agent");
+    const issueId = await seedIssue(company.companyId, agentId);
+    const unknownAgent = agentActor(company.companyId, agentId, UNKNOWN_RUN_ID);
+
+    const forbidden = await request(appFor(unknownAgent))
+      .patch(`/api/issues/${issueId}`)
+      .send(teardownPatch);
+    expect(forbidden.status).toBe(403);
+    expect(forbidden.body.error).toContain("host-executed workspace commands");
+    expect(JSON.stringify(forbidden.body)).not.toContain("unknown_run_id");
+
+    const title = await request(appFor(unknownAgent))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "should-not-stick" });
+    expectUnknownRun(title);
+
+    const board = await request(appFor({ ...company.actor, runId: UNKNOWN_RUN_ID }))
+      .patch(`/api/issues/${issueId}`)
+      .send(teardownPatch);
+    expectUnknownRun(board);
+
+    const runId = await seedRun(company.companyId, agentId);
+    const inScope = await request(appFor(agentActor(company.companyId, agentId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(teardownPatch);
+    expect(inScope.status).toBe(403);
+    expect(inScope.body.error).toContain("host-executed workspace commands");
+
+    await ctx.db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const deletedField = await request(appFor(agentActor(company.companyId, agentId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "deleted-run" });
+    expectUnknownRun(deletedField);
+
+    const deletedCommand = await request(appFor(agentActor(company.companyId, agentId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(teardownPatch);
+    expect(deletedCommand.status).toBe(403);
+    expect(deletedCommand.body.error).toContain("host-executed workspace commands");
+
+    const row = await ctx.db.query.issues.findFirst({
+      where: (table, { eq: whereEq }) => whereEq(table.id, issueId),
+    });
+    expect(row?.title).toBe("Write back");
+    expect(row?.assigneeAdapterOverrides ?? null).toBeNull();
+    const written = await ctx.db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(written).toEqual([]);
+  });
+
   it("rejects a missing run, a cross-company run, and another agent's run on checkout and PATCH", async () => {
     const company = await seedCompanyWithBoardAccess(ctx.db, "Home");
     const other = await seedCompanyWithBoardAccess(ctx.db, "Other");
