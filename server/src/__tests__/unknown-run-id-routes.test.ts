@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
+import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -15,6 +16,8 @@ import { HttpError } from "../errors.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { issueRoutes } from "../routes/issues.js";
 import { logActivity } from "../services/activity-log.js";
+import { setBeforeScopedHeartbeatWrite } from "../services/heartbeat-run-scope.js";
+import { setBeforeUnscopedCheckoutAdoption } from "../services/issues.js";
 import {
   describeEmbeddedPostgres,
   seedCompanyWithBoardAccess,
@@ -24,6 +27,11 @@ import {
 const UNKNOWN_RUN_ID = "d26b3c44-1111-4111-8111-111111111111";
 
 describeEmbeddedPostgres("unknown X-Paperclip-Run-Id on checkout and PATCH", () => {
+  afterEach(() => {
+    setBeforeUnscopedCheckoutAdoption(null);
+    setBeforeScopedHeartbeatWrite(null);
+  });
+
   const ctx = useEmbeddedPostgres("paperclip-unknown-run-id-", {
     resetEach: async (db) => {
       await db.delete(activityLog);
@@ -164,6 +172,18 @@ describeEmbeddedPostgres("unknown X-Paperclip-Run-Id on checkout and PATCH", () 
     expect(patched.status).toBe(200);
     expect(patched.body.title).toBe("Persisted");
     expect(JSON.stringify(patched.body)).not.toContain("Failed query");
+
+    const activity = await ctx.db
+      .select({ action: activityLog.action, runId: activityLog.runId, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(activity).toContainEqual(
+      expect.objectContaining({
+        action: "issue.updated",
+        runId,
+        details: expect.objectContaining({ title: "Persisted" }),
+      }),
+    );
   });
 
   it("rejects a board actor attaching another company's run and accepts an in-company run", async () => {
@@ -224,5 +244,222 @@ describeEmbeddedPostgres("unknown X-Paperclip-Run-Id on checkout and PATCH", () 
       expect(JSON.stringify(error)).not.toContain("params");
       expect((error as Error).message).not.toContain(foreignRunId);
     }
+  });
+
+  async function waitUntilBlocked(
+    blockerPid: number,
+    pending: Promise<{ status: number; body: unknown }>,
+  ) {
+    let early: { status: number; body: unknown } | undefined;
+    pending.then((result) => {
+      early = result;
+    }).catch(() => {});
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (early) {
+        throw new Error(`request finished before blocking: ${early.status} ${JSON.stringify(early.body)}`);
+      }
+      const [state] = await ctx.db.execute(sql`select exists (
+        select 1 from pg_stat_activity where ${blockerPid} = any(pg_blocking_pids(pid))
+      ) as waiting`) as unknown as Array<{ waiting: boolean }>;
+      if (state?.waiting) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`timed out waiting for pid ${blockerPid} to block a request`);
+  }
+
+  async function deleteRunWhileRequestBlocks(
+    runId: string,
+    startRequest: () => Promise<{ status: number; body: unknown }>,
+    mutate?: (tx: Parameters<Parameters<typeof ctx.db.transaction>[0]>[0]) => Promise<void>,
+  ) {
+    let pending!: Promise<{ status: number; body: unknown }>;
+    await ctx.db.transaction(async (tx) => {
+      await tx.execute(sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${runId} for update`);
+      const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`) as unknown as Array<{ pid: number }>;
+      pending = startRequest();
+      await waitUntilBlocked(Number(backend?.pid), pending);
+      if (mutate) await mutate(tx);
+      else await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    });
+    return pending;
+  }
+
+  it("rolls back checkout when a real run row is deleted while the write waits on its lock", async () => {
+    const company = await seedCompanyWithBoardAccess(ctx.db, "Home");
+    const agentId = await seedAgent(company.companyId, "Home agent");
+    const checkoutRunId = await seedRun(company.companyId, agentId);
+    const issueId = await seedIssue(company.companyId, agentId);
+
+    const checkout = await deleteRunWhileRequestBlocks(checkoutRunId, () =>
+      request(appFor(agentActor(company.companyId, agentId, checkoutRunId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses: ["todo"] }));
+    expectUnknownRun(checkout);
+
+    const row = await ctx.db.query.issues.findFirst({
+      where: (table, { eq: whereEq }) => whereEq(table.id, issueId),
+    });
+    expect(row?.title).toBe("Write back");
+    expect(row?.status).toBe("todo");
+    expect(row?.checkoutRunId).toBeNull();
+  });
+
+  it("rolls back a PATCH when the run is deleted after the unlocked check and before the write lock", async () => {
+    const company = await seedCompanyWithBoardAccess(ctx.db, "Home");
+    const agentId = await seedAgent(company.companyId, "Home agent");
+    const runId = await seedRun(company.companyId, agentId);
+    const issueId = await seedIssue(company.companyId, agentId);
+
+    setBeforeScopedHeartbeatWrite(async () => {
+      await ctx.db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    });
+
+    const patched = await request(appFor(agentActor(company.companyId, agentId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "should-roll-back" });
+    expectUnknownRun(patched);
+
+    const row = await ctx.db.query.issues.findFirst({
+      where: (table, { eq: whereEq }) => whereEq(table.id, issueId),
+    });
+    expect(row?.title).toBe("Write back");
+    expect(row?.status).toBe("todo");
+    const written = await ctx.db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(written).toEqual([]);
+  });
+
+  it("does not keep a same-UUID run that was reinserted under another company", async () => {
+    const company = await seedCompanyWithBoardAccess(ctx.db, "Home");
+    const other = await seedCompanyWithBoardAccess(ctx.db, "Other");
+    const agentId = await seedAgent(company.companyId, "Home agent");
+    const foreignAgentId = await seedAgent(other.companyId, "Foreign agent");
+    const runId = await seedRun(company.companyId, agentId);
+    const issueId = await seedIssue(company.companyId, agentId);
+
+    const checkout = await deleteRunWhileRequestBlocks(
+      runId,
+      () => request(appFor(agentActor(company.companyId, agentId, runId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses: ["todo"] }),
+      async (tx) => {
+        await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        await tx.insert(heartbeatRuns).values({
+          id: runId,
+          companyId: other.companyId,
+          agentId: foreignAgentId,
+          invocationSource: "on_demand",
+          status: "running",
+        });
+      },
+    );
+    expectUnknownRun(checkout);
+
+    const row = await ctx.db.query.issues.findFirst({
+      where: (table, { eq: whereEq }) => whereEq(table.id, issueId),
+    });
+    expect(row?.checkoutRunId).toBeNull();
+    expect(row?.status).toBe("todo");
+    const moved = await ctx.db.query.heartbeatRuns.findFirst({
+      where: (table, { eq: whereEq }) => whereEq(table.id, runId),
+    });
+    expect(moved?.companyId).toBe(other.companyId);
+  });
+
+  it("rejects stale-execution adoption when the actor run is deleted and reinserted in another company", async () => {
+    const company = await seedCompanyWithBoardAccess(ctx.db, "Home");
+    const other = await seedCompanyWithBoardAccess(ctx.db, "Other");
+    const agentId = await seedAgent(company.companyId, "Home agent");
+    const foreignAgentId = await seedAgent(other.companyId, "Foreign agent");
+    const actorRunId = await seedRun(company.companyId, agentId);
+    const executionRunId = await seedRun(company.companyId, agentId);
+    const issueId = randomUUID();
+    await ctx.db.insert(issues).values({
+      id: issueId,
+      companyId: company.companyId,
+      title: "Stale execution",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      executionRunId,
+    });
+
+    setBeforeUnscopedCheckoutAdoption(async () => {
+      await ctx.db
+        .update(heartbeatRuns)
+        .set({ status: "failed", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, executionRunId));
+      await ctx.db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, actorRunId));
+      await ctx.db.insert(heartbeatRuns).values({
+        id: actorRunId,
+        companyId: other.companyId,
+        agentId: foreignAgentId,
+        invocationSource: "on_demand",
+        status: "running",
+      });
+    });
+
+    const checkout = await request(appFor(agentActor(company.companyId, agentId, actorRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId, expectedStatuses: ["todo"] });
+    expectUnknownRun(checkout);
+
+    const row = await ctx.db.query.issues.findFirst({
+      where: (table, { eq: whereEq }) => whereEq(table.id, issueId),
+    });
+    expect(row?.status).toBe("todo");
+    expect(row?.checkoutRunId).toBeNull();
+    expect(row?.executionRunId).toBe(executionRunId);
+    expect(row?.assigneeAgentId).toBe(agentId);
+  });
+
+  it("rejects stale checkout adoption when the actor run is reinserted under another company", async () => {
+    const company = await seedCompanyWithBoardAccess(ctx.db, "Home");
+    const other = await seedCompanyWithBoardAccess(ctx.db, "Other");
+    const agentId = await seedAgent(company.companyId, "Home agent");
+    const foreignAgentId = await seedAgent(other.companyId, "Foreign agent");
+    const actorRunId = await seedRun(company.companyId, agentId);
+    const staleCheckoutRunId = await seedRun(company.companyId, agentId);
+    const executionRunId = await seedRun(company.companyId, agentId);
+    await ctx.db
+      .update(heartbeatRuns)
+      .set({ status: "failed", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, staleCheckoutRunId));
+    const issueId = randomUUID();
+    await ctx.db.insert(issues).values({
+      id: issueId,
+      companyId: company.companyId,
+      title: "Stale checkout",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: staleCheckoutRunId,
+      executionRunId,
+    });
+
+    setBeforeUnscopedCheckoutAdoption(async () => {
+      await ctx.db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, actorRunId));
+      await ctx.db.insert(heartbeatRuns).values({
+        id: actorRunId,
+        companyId: other.companyId,
+        agentId: foreignAgentId,
+        invocationSource: "on_demand",
+        status: "running",
+      });
+    });
+
+    const checkout = await request(appFor(agentActor(company.companyId, agentId, actorRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId, expectedStatuses: ["in_progress", "todo"] });
+    expectUnknownRun(checkout);
+
+    const row = await ctx.db.query.issues.findFirst({
+      where: (table, { eq: whereEq }) => whereEq(table.id, issueId),
+    });
+    expect(row?.status).toBe("in_progress");
+    expect(row?.checkoutRunId).toBe(staleCheckoutRunId);
+    expect(row?.executionRunId).toBe(executionRunId);
   });
 });
