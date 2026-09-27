@@ -189,6 +189,12 @@ import {
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import {
+  assertScopedHeartbeatRun,
+  isHeartbeatRunReferenceViolation,
+  unknownRunIdError,
+  withScopedHeartbeatRun,
+} from "./heartbeat-run-scope.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -11228,6 +11234,23 @@ export function issueService(db: Db) {
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
       if (!issueCompany) throw notFound("Issue not found");
+      if (checkoutRunId) {
+        await assertScopedHeartbeatRun(db, {
+          runId: checkoutRunId,
+          companyId: issueCompany.companyId,
+          agentId,
+        });
+      }
+      const writeCheckout = <T>(run: (tx: Db) => Promise<T>) =>
+        withScopedHeartbeatRun(
+          db,
+          {
+            runId: checkoutRunId,
+            companyId: issueCompany.companyId,
+            agentId,
+          },
+          run,
+        );
       await assertAssignableAgent(db, issueCompany.companyId, agentId, {
         kind: "work",
       });
@@ -11300,27 +11323,32 @@ export function issueService(db: Db) {
             eq(issues.executionRunId, checkoutRunId),
           )
         : isNull(issues.executionRunId);
-      const updated = await db
-        .update(issues)
-        .set({
-          assigneeAgentId: agentId,
-          assigneeUserId: null,
-          checkoutRunId,
-          executionRunId: checkoutRunId,
-          status: "in_progress",
-          startedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, id),
-            inArray(issues.status, expectedStatuses),
-            or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
-            executionLockCondition,
-          ),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const updated = await writeCheckout((tx) =>
+        tx
+          .update(issues)
+          .set({
+            assigneeAgentId: agentId,
+            assigneeUserId: null,
+            checkoutRunId,
+            executionRunId: checkoutRunId,
+            status: "in_progress",
+            startedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, id),
+              inArray(issues.status, expectedStatuses),
+              or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+              executionLockCondition,
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null),
+      ).catch((error: unknown) => {
+        if (isHeartbeatRunReferenceViolation(error)) throw unknownRunIdError();
+        throw error;
+      });
 
       if (updated) {
         const [enriched] = await withIssueLabels(db, [updated]);
@@ -11349,27 +11377,32 @@ export function issueService(db: Db) {
           current.executionRunId === checkoutRunId) &&
         checkoutRunId
       ) {
-        const adopted = await db
-          .update(issues)
-          .set({
-            checkoutRunId,
-            executionRunId: checkoutRunId,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(issues.id, id),
-              eq(issues.status, "in_progress"),
-              eq(issues.assigneeAgentId, agentId),
-              isNull(issues.checkoutRunId),
-              or(
-                isNull(issues.executionRunId),
-                eq(issues.executionRunId, checkoutRunId),
+        const adopted = await writeCheckout((tx) =>
+          tx
+            .update(issues)
+            .set({
+              checkoutRunId,
+              executionRunId: checkoutRunId,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(issues.id, id),
+                eq(issues.status, "in_progress"),
+                eq(issues.assigneeAgentId, agentId),
+                isNull(issues.checkoutRunId),
+                or(
+                  isNull(issues.executionRunId),
+                  eq(issues.executionRunId, checkoutRunId),
+                ),
               ),
-            ),
-          )
-          .returning()
-          .then((rows) => rows[0] ?? null);
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null),
+        ).catch((error: unknown) => {
+          if (isHeartbeatRunReferenceViolation(error)) throw unknownRunIdError();
+          throw error;
+        });
         if (adopted) return adopted;
       }
 
@@ -11439,7 +11472,11 @@ export function issueService(db: Db) {
               ),
             )
             .returning()
-            .then((rows) => rows[0] ?? null);
+            .then((rows) => rows[0] ?? null)
+            .catch((error: unknown) => {
+              if (isHeartbeatRunReferenceViolation(error)) throw unknownRunIdError();
+              throw error;
+            });
           if (adopted) {
             const [enriched] = await withIssueLabels(db, [adopted]);
             return enriched;
