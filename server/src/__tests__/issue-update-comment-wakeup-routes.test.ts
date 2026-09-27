@@ -59,6 +59,17 @@ vi.mock("../services/runner-goals.js", () => ({
   RunnerGoalConflictError: class RunnerGoalConflictError extends Error {},
 }));
 
+vi.mock("../services/heartbeat-run-scope.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/heartbeat-run-scope.js")>(),
+  assertScopedHeartbeatRun: vi.fn(async () => undefined),
+  lockScopedHeartbeatRun: vi.fn(async () => undefined),
+}));
+
+vi.mock("../services/activity-log.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/activity-log.js")>(),
+  redactActivityDetails: vi.fn(async (_db: unknown, details: unknown) => details),
+}));
+
 vi.mock("../services/index.js", () => ({
   companyService: () => ({
     getById: vi.fn(async () => ({ id: "company-1" })),
@@ -119,6 +130,11 @@ vi.mock("../services/index.js", () => ({
   issueService: () => mockIssueService,
   issueThreadInteractionService: () => mockIssueThreadInteractionService,
   logActivity: vi.fn(async () => undefined),
+  persistActivity: vi.fn(async () => ({
+    activity: { id: "activity-1" },
+    publication: { companyId: "company-1", payload: {}, pluginEvent: null },
+  })),
+  publishActivity: vi.fn(),
   projectService: () => ({}),
   questionResponseDeliveryService: () => ({
     deliver: vi.fn(async () => undefined),
@@ -190,6 +206,11 @@ function registerModuleMocks() {
   issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: vi.fn(async () => undefined),
+    persistActivity: vi.fn(async () => ({
+      activity: { id: "activity-1" },
+      publication: { companyId: "company-1", payload: {}, pluginEvent: null },
+    })),
+    publishActivity: vi.fn(),
     projectService: () => ({}),
     questionResponseDeliveryService: () => ({
       deliver: vi.fn(async () => undefined),
@@ -221,6 +242,7 @@ async function createApp() {
   });
   app.use("/api", issueRoutes({
     transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
+    update: () => ({ set: () => ({ where: async () => undefined }) }),
   } as any, {} as any));
   app.use(errorHandler);
   return app;
