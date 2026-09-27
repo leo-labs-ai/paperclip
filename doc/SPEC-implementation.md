@@ -619,7 +619,12 @@ that does not reference a heartbeat run in the target issue's company — and, f
 agent actor, that agent's own run — is HTTP 422 `unknown_run_id` on issue checkout
 and issue PATCH. The response does not include SQL, query text, or bind parameters.
 A run deleted between the scope check and the write is the same 422, not a 500.
-A run that exists only in another company is rejected the same way. A run may attempt at most 20 cross-issue comments, issue
+Issue PATCH holds that scoped run lock across the issue update and its
+`issue.updated` activity, so a disappearing run rolls the issue write back
+instead of leaving a committed mutation and then returning 422. Checkout writes
+that store the actor run, including stale-execution adoption, hold the same
+company and agent lock. A same-UUID row reinserted under another company is
+rejected. A run that exists only in another company is rejected the same way. A run may attempt at most 20 cross-issue comments, issue
 updates, or issue-thread interaction resolutions across one shared counter. The
 server records each attempt with its source issue, target issue, run, count, and
 rollout mode, and fails closed with the cap in the error once enforcement is

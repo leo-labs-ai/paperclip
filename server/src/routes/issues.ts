@@ -172,6 +172,7 @@ import {
   documentService,
   documentAnnotationService,
   logActivity,
+  persistActivity,
   publishActivity,
   projectService,
   routineService,
@@ -236,7 +237,12 @@ import {
   collectIssueWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
-import { assertScopedHeartbeatRun } from "../services/heartbeat-run-scope.js";
+import {
+  assertScopedHeartbeatRun,
+  lockScopedHeartbeatRun,
+  runBeforeScopedHeartbeatWrite,
+} from "../services/heartbeat-run-scope.js";
+import { redactActivityDetails } from "../services/activity-log.js";
 import {
   formatAttachmentSize,
   GENERIC_ATTACHMENT_CONTENT_TYPES,
@@ -13646,9 +13652,51 @@ export function issueRoutes(
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
         reviewPolicySensitiveMutationRequested;
+      const scopedPatchRun =
+        typeof actor.runId === "string" && actor.runId.trim().length > 0
+          ? {
+              runId: actor.runId,
+              companyId: existing.companyId,
+              agentId:
+                actor.actorType === "agent" ? (actor.agentId ?? "") : null,
+            }
+          : null;
+      const scopedIssueUpdateSlot: {
+        value: { id: string; publication: ActivityPublication } | null;
+      } = { value: null };
+      const recordScopedIssueUpdate = async (
+        tx: Parameters<typeof svc.update>[2],
+        updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>,
+      ) => {
+        const { activity, publication } = await persistActivity(tx as unknown as Db, {
+          companyId: updated.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: updated.id,
+          details: {
+            identifier: updated.identifier,
+            authorizationReason: issueMutationAuthorizationReason,
+            changes: updated.changes ?? {},
+          },
+        });
+        if (!activity?.id) {
+          throw new Error("issue update activity did not return an id");
+        }
+        scopedIssueUpdateSlot.value = { id: activity.id, publication };
+      };
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (scopedPatchRun) {
+              await runBeforeScopedHeartbeatWrite();
+              await lockScopedHeartbeatRun(tx, scopedPatchRun);
+            }
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -13701,8 +13749,18 @@ export function issueRoutes(
               );
             }
 
-            await persistReviewTransitionActivity(tx, updated);
+            if (scopedPatchRun) await recordScopedIssueUpdate(tx, updated);
+            else await persistReviewTransitionActivity(tx, updated);
 
+            return updated;
+          });
+        } else if (scopedPatchRun) {
+          issue = await db.transaction(async (tx) => {
+            await runBeforeScopedHeartbeatWrite();
+            await lockScopedHeartbeatRun(tx, scopedPatchRun);
+            const updated = await updateIssue(tx);
+            if (!updated) return null;
+            await recordScopedIssueUpdate(tx, updated);
             return updated;
           });
         } else {
@@ -13958,19 +14016,9 @@ export function issueRoutes(
           activeRecoveryAction: null,
         };
       }
-      if (!persistReviewActivityTransactionally)
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
-          action: "issue.updated",
-          entityType: "issue",
-          entityId: issue.id,
-          details: {
+      const scopedUpdate = scopedIssueUpdateSlot.value;
+      if (scopedUpdate || !persistReviewActivityTransactionally) {
+        const issueUpdatedDetails = {
             ...updateFields,
             identifier: issue.identifier,
             authorizationReason: issueMutationAuthorizationReason,
@@ -14017,8 +14065,47 @@ export function issueRoutes(
                   }
                 : null,
             ),
-          },
-        });
+        };
+        if (scopedUpdate) {
+          const redactedDetails = await redactActivityDetails(db, issueUpdatedDetails);
+          await db
+            .update(activityLog)
+            .set({ details: redactedDetails })
+            .where(
+              and(
+                eq(activityLog.id, scopedUpdate.id),
+                eq(activityLog.companyId, issue.companyId),
+              ),
+            );
+          scopedUpdate.publication.payload.details = redactedDetails;
+          if (scopedUpdate.publication.pluginEvent) {
+            scopedUpdate.publication.pluginEvent.payload = {
+              ...(redactedDetails ?? {}),
+              agentId: actor.agentId ?? null,
+              runId: actor.runId ?? null,
+              responsibleUserId:
+                typeof scopedUpdate.publication.payload.responsibleUserId === "string"
+                  ? scopedUpdate.publication.payload.responsibleUserId
+                  : null,
+            };
+          }
+          publishActivity(scopedUpdate.publication);
+        } else {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+            action: "issue.updated",
+            entityType: "issue",
+            entityId: issue.id,
+            details: issueUpdatedDetails,
+          });
+        }
+      }
 
       if (
         existing.status === "in_progress" &&

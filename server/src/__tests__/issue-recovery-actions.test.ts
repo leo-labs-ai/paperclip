@@ -2344,11 +2344,18 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       nextAction: "Restore a live execution path.",
       wakePolicy: { type: "manual" },
     });
+    const coderRunId = randomUUID();
+    await seedHeartbeatRun({
+      companyId,
+      agentId: coderId,
+      runId: coderRunId,
+      issueId: sourceIssueId,
+    });
     const app = createApp({
       type: "agent",
       agentId: coderId,
       companyId,
-      runId: randomUUID(),
+      runId: coderRunId,
       source: "agent_jwt",
     });
 

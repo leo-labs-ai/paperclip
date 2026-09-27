@@ -49,6 +49,13 @@ describe("unknown run id contract", () => {
   });
 
   it("strips query text and bind parameters from logged errors", () => {
+    const asText = serializeErrorWithoutDatabaseQuery(
+      `Failed query: ${SQL_CANARY}\nparams: ${PARAM_CANARY}`,
+    );
+    expect(asText).toBe("Failed query: [redacted]");
+    expect(asText).not.toContain(SQL_CANARY);
+    expect(asText).not.toContain(PARAM_CANARY);
+
     const serialized = JSON.stringify(serializeErrorWithoutDatabaseQuery(drizzleFault()));
     expect(serialized).not.toContain(SQL_CANARY);
     expect(serialized).not.toContain(PARAM_CANARY);
@@ -56,6 +63,76 @@ describe("unknown run id contract", () => {
     expect(serialized).not.toContain('"params"');
     expect(serialized).toContain("23503");
     expect(serialized).toContain("issues_checkout_run_id_heartbeat_runs_id_fk");
+  });
+
+  it("redacts nested query text without dropping non-secret diagnostics or looping on cycles", () => {
+    const cause: Record<string, unknown> = {
+      code: "23503",
+      constraint_name: "issues_checkout_run_id_heartbeat_runs_id_fk",
+      message: "insert or update violates foreign key constraint",
+    };
+    const details: Record<string, unknown> = {
+      note: "pool exhausted",
+      cause,
+    };
+    details.self = details;
+    cause.details = details;
+    let buried: unknown = { query: SQL_CANARY, params: [PARAM_CANARY] };
+    for (let depth = 0; depth < 20; depth += 1) buried = { details: buried };
+    const fault = Object.assign(new Error(`Failed query: ${SQL_CANARY}\nparams: ${PARAM_CANARY}`), {
+      query: SQL_CANARY,
+      params: [PARAM_CANARY],
+      code: "23503",
+      summary: "still-operational",
+      cause,
+      details: buried,
+    });
+
+    const serialized = JSON.stringify(serializeErrorWithoutDatabaseQuery(fault));
+    expect(serialized).toContain("[circular]");
+    expect(serialized).toContain("[max-depth]");
+    expect(serialized).toContain("pool exhausted");
+    expect(serialized).toContain("23503");
+    expect(serialized).toContain("issues_checkout_run_id_heartbeat_runs_id_fk");
+    expect(serialized).toContain("still-operational");
+    expect(serialized).not.toContain(SQL_CANARY);
+    expect(serialized).not.toContain(PARAM_CANARY);
+    expect(serialized).not.toContain('"query"');
+    expect(serialized).not.toContain('"params"');
+
+    const safe = databaseFaultForClient(fault);
+    expect(safe).not.toBe(fault);
+    expect(safe.message).toBe("Failed query: [redacted]");
+    expect(JSON.stringify(safe.cause)).toContain("issues_checkout_run_id_heartbeat_runs_id_fk");
+    expect(JSON.stringify(safe)).not.toContain(SQL_CANARY);
+    expect(JSON.stringify(safe)).not.toContain(PARAM_CANARY);
+
+    const operational = Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+    expect(databaseFaultForClient(operational)).toBe(operational);
+    expect(JSON.stringify(serializeErrorWithoutDatabaseQuery(operational))).toContain("connection refused");
+
+    let onlyDeep: unknown = {
+      query: SQL_CANARY,
+      params: [PARAM_CANARY],
+      message: `Failed query: ${SQL_CANARY}`,
+    };
+    for (let depth = 0; depth < 20; depth += 1) onlyDeep = { details: onlyDeep };
+    const deepOnly = Object.assign(new Error("pool exhausted"), {
+      code: "53300",
+      summary: "still-operational",
+      details: onlyDeep,
+    });
+    const deepSafe = databaseFaultForClient(deepOnly);
+    expect(deepSafe).not.toBe(deepOnly);
+    expect(deepSafe.message).toBe("pool exhausted");
+    const deepSerialized = JSON.stringify(deepSafe);
+    expect(deepSerialized).toContain("[max-depth]");
+    expect(deepSerialized).toContain("still-operational");
+    expect(deepSerialized).toContain("53300");
+    expect(deepSerialized).not.toContain(SQL_CANARY);
+    expect(deepSerialized).not.toContain(PARAM_CANARY);
+    expect(deepSerialized).not.toContain('"query"');
+    expect(deepSerialized).not.toContain('"params"');
   });
 
   it("does not put query or params on an unexpected database 500", async () => {

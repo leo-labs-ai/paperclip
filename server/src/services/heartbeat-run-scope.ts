@@ -116,6 +116,22 @@ export async function assertScopedHeartbeatRun(
 }
 
 /**
+ * Test seam. Runs after an unlocked scope check and before the write
+ * transaction locks the run. Production leaves it unset.
+ */
+let beforeScopedHeartbeatWrite: (() => Promise<void>) | null = null;
+
+export function setBeforeScopedHeartbeatWrite(
+  probe: (() => Promise<void>) | null,
+) {
+  beforeScopedHeartbeatWrite = probe;
+}
+
+export async function runBeforeScopedHeartbeatWrite() {
+  if (beforeScopedHeartbeatWrite) await beforeScopedHeartbeatWrite();
+}
+
+/**
  * Locks the in-scope run row against delete and primary-key reuse until the
  * surrounding transaction commits. `FOR KEY SHARE` does not block ordinary
  * heartbeat status updates. A missing or out-of-scope id throws
