@@ -450,16 +450,30 @@ export function socketWithInactivityTimeout(
             }, connectTimeoutMs).unref()
           : null;
 
-      // Armed from the dial onwards and refreshed only by inbound data, so a
-      // stream of outbound writes on a socket whose peer has gone silent
-      // cannot postpone it.
+      // Armed from the dial onwards and re-armed only when the socket's read
+      // counter has moved, so a stream of outbound writes on a socket whose
+      // peer has gone silent cannot postpone it.
+      //
+      // `bytesRead`, not a `data` listener: once postgres.js's `secure()`
+      // hands this socket to `tls.connect({ socket })`, the TLS wrapper takes
+      // the reads over and the raw socket emits no further `data` events, so
+      // a listener-driven window would expire on a perfectly healthy TLS
+      // connection — every `sslmode=require` deployment — and destroy it
+      // mid-query. The kernel-level byte counter keeps advancing under the
+      // TLS wrap, which makes the same "nothing read from the peer" question
+      // answerable on plaintext and TLS alike.
+      let lastBytesRead = 0;
       const readIdleTimer = setTimeout(onReadIdle, timeoutMs).unref();
-      socket.on("data", () => readIdleTimer.refresh());
       socket.once("close", () => clearTimeout(readIdleTimer));
 
       function onReadIdle(): void {
         if (!settled) {
           settle(connectionClosed(`Database socket read nothing within ${timeoutMs}ms`));
+          return;
+        }
+        if (socket.bytesRead !== lastBytesRead) {
+          lastBytesRead = socket.bytesRead;
+          readIdleTimer.refresh();
           return;
         }
         // Destroy with no error argument. postgres.js's own `closed(hadError)`

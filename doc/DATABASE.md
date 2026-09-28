@@ -208,9 +208,9 @@ auth request itself:
 | Env var | Default | Meaning |
 |---|---|---|
 | `PAPERCLIP_DB_KEEPALIVE_SEC` | `15` | postgres.js `keep_alive`: TCP keepalive idle delay before the OS sends the first probe on a pooled socket. `0` disables. How fast the kernel gives up after that first probe depends on `TCP_KEEPINTVL`/`TCP_KEEPCNT`, which Node does not expose per-socket — tuning those is the paired lue-kube (pod `sysctls`) change, not this one. |
-| `PAPERCLIP_DB_SOCKET_TIMEOUT_MS` | derived from `statement_timeout` (comfortably above it; `10` minutes when `statement_timeout` is disabled) | Client-side backstop that does not depend on OS keepalive tuning at all: destroys a pooled socket after this many ms without a single byte *read* from the peer, forcing postgres.js's existing reconnect path to replace it on the next query. Reads only, not reads-or-writes: postgres.js pipelines, so counting outbound writes would let every further query written onto an already-dead socket postpone the backstop indefinitely. `0` disables. |
+| `PAPERCLIP_DB_SOCKET_TIMEOUT_MS` | derived from `statement_timeout` (comfortably above it; `10` minutes when `statement_timeout` is disabled) | Client-side backstop that does not depend on OS keepalive tuning at all: destroys a pooled socket after this many ms without a single byte *read* from the peer, forcing postgres.js's existing reconnect path to replace it on the next query. Reads only, not reads-or-writes: postgres.js pipelines, so counting outbound writes would let every further query written onto an already-dead socket postpone the backstop indefinitely. Silence is measured from the socket's `bytesRead` counter rather than its `data` events, because postgres.js hands the socket to `tls.connect()` on an `sslmode=require` URL and the raw socket emits no `data` after that — a counter keeps working under the TLS wrap. The check re-arms when the counter has moved, so a dead socket is reclaimed between one and two windows after the last byte. `0` disables. |
 | `PAPERCLIP_DB_CONNECT_TIMEOUT_SEC` | `10` | postgres.js `connect_timeout`. The driver default (30s) is tuned for an occasionally-slow network, not a repeatedly-unreachable failed-over primary; a shorter budget means a doomed connection attempt fails, and the next attempt (which may hit a now-healthy replica-turned-primary) starts sooner. `0` restores the driver default (the option is left unset rather than passed through as `0`, which postgres.js would read as "no connect timer at all"). With the socket factory below installed this bound also covers the TCP dial itself, which the driver's own `connect_timeout` does not: postgres.js starts its connect timer only after the factory has returned a socket. The upstream `DATABASE_CONNECT_TIMEOUT_SECONDS` knob still wins when set. |
-| `PAPERCLIP_AUTH_DB_TIMEOUT_MS` | `5000` | Application-level ceiling on a single Bearer/agent-key auth DB lookup in `server/src/middleware/auth.ts` (`authDbLookup`), including its own transient-connection retries. This is the layer that actually bounds the auth request: a connection recovery attempt that itself lands on another still-unreachable target has no bound of its own inside postgres.js (its handling of a first query on a brand-new connection retries silently until it either succeeds or the process exits), so this timeout is what turns a hung Bearer/agent-key request into a fast, clear failure instead of an indefinite hang. |
+| `PAPERCLIP_AUTH_DB_TIMEOUT_MS` | `5000` | Application-level ceiling on a single auth DB lookup in `server/src/middleware/auth.ts` (`authDbLookup`, and `withAuthDbTimeout` for the calls that must not be replayed), including its own transient-connection retries. It bounds one lookup, not one request: a request that performs several sequential lookups (the agent-JWT branch does) is bounded by their sum, not by this single value. This is the layer that bounds the auth path at all: a connection recovery attempt that itself lands on another still-unreachable target has no bound of its own inside postgres.js (its handling of a first query on a brand-new connection retries silently until it either succeeds or the process exits), so this timeout is what turns a hung Bearer, agent-key, or browser-session request into a fast, clear failure instead of an indefinite hang. |
 
 `PAPERCLIP_DB_SOCKET_TIMEOUT_MS` is implemented via a custom postgres.js `socket` factory
 (`socketWithInactivityTimeout` in `packages/db/src/client.ts`) since there is no native
@@ -236,14 +236,27 @@ Wire this path into the k8s `readinessProbe` (paired lue-kube change) so a wedge
 connection pulls the pod out of rotation instead of continuing to accept traffic it cannot
 serve.
 
-A Bearer/agent-key request whose auth lookup hits `PAPERCLIP_AUTH_DB_TIMEOUT_MS` answers
+The browser-session branch of `actorMiddleware` is bounded the same way: it draws from the
+same pool, so `resolveCloudTenantActor` and the session's instance-role/membership lookups
+go through the same ceiling and answer `503 AUTH_DB_TIMEOUT` instead of hanging the board
+UI. `resolveCloudTenantActor` and the two `activity_log` audit inserts take
+`withAuthDbTimeout` rather than `authDbLookup`: the first already owns its transient-connection
+replay, and replaying a committed audit INSERT whose reply was lost to the switchover would
+write a second, false row.
+
+A request whose auth lookup hits `PAPERCLIP_AUTH_DB_TIMEOUT_MS` answers
 `503 {"error": …, "code": "AUTH_DB_TIMEOUT"}`, not a generic 500, so a caller (and anything
 watching the API) can tell a transiently unreachable database from a server bug and retry.
 That mapping also keeps a failover from flooding the crash-reporting sinks: `errorHandler`
 (`server/src/middleware/error-handler.ts`) recognizes the `AUTH_DB_TIMEOUT` code and emits a
 rate-limited (once per 30s) `logger.warn` instead of calling `reportCrash` -- Sentry/telemetry
 never see a burst of hundreds of identical, non-actionable crash events for what is an
-expected, transient condition during a switchover.
+expected, transient condition during a switchover. That warn line carries
+`suppressedSinceLastLog`, the number of occurrences the window stood in for, so the scale of
+a failover is still legible. The same condition also skips `attachErrorContext`, and marks
+the response so the access log records it at warn rather than error level: otherwise the
+flood would simply move from Sentry into the log sink, one error-level line per affected
+request. Every other 500-class error keeps the unchanged error context and crash report.
 
 A pre-connect dial failure through `socketWithInactivityTimeout` (a refused connection, or
 the factory's own `connectTimeoutMs` firing) is also patched at the postgres.js level

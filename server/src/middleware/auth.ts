@@ -168,7 +168,7 @@ async function auditAgentJwtRunHeaderMismatch(
   input: { companyId: string; agentId: string; claimRunId: string; headerRunId: string; method: string; url: string },
 ) {
   try {
-    await authDbLookup(() =>
+    await withAuthDbTimeout(() =>
       db.insert(activityLog).values({
         companyId: input.companyId,
         actorType: "agent",
@@ -199,7 +199,7 @@ async function auditAgentKeyMissingResponsibleUser(
   input: { companyId: string; agentId: string; keyId: string; method: string; url: string },
 ) {
   try {
-    await authDbLookup(() =>
+    await withAuthDbTimeout(() =>
       db.insert(activityLog).values({
         companyId: input.companyId,
         actorType: "agent",
@@ -282,7 +282,12 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     if (!hasBearerCredentials) {
       if (opts.deploymentMode === "authenticated" && opts.resolveSession) {
-        const cloudTenantActor = await resolveCloudTenantActor(db, req);
+        // Bounded like every Bearer/agent-key lookup: the browser-session
+        // branch draws from the same pool, so an unbounded await here is the
+        // same HOM-441 hang for the board UI. `resolveCloudTenantActor` owns
+        // its own transient-connection replay, so it takes the wall-clock
+        // bound alone rather than a second layer of retries.
+        const cloudTenantActor = await withAuthDbTimeout(() => resolveCloudTenantActor(db, req));
         if (cloudTenantActor) {
           req.actor = {
             ...cloudTenantActor,
@@ -303,14 +308,16 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         }
         if (session?.user?.id && session.session?.id) {
           const userId = session.user.id;
-          const [roleRow, memberships] = await Promise.all([
-            db
-              .select({ id: instanceUserRoles.id })
-              .from(instanceUserRoles)
-              .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
-              .then((rows) => rows[0] ?? null),
-            loadActiveUserCompanyMemberships(db, userId),
-          ]);
+          const [roleRow, memberships] = await authDbLookup(() =>
+            Promise.all([
+              db
+                .select({ id: instanceUserRoles.id })
+                .from(instanceUserRoles)
+                .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
+                .then((rows) => rows[0] ?? null),
+              loadActiveUserCompanyMemberships(db, userId),
+            ]),
+          );
           req.actor = {
             type: "board",
             userId,
@@ -679,11 +686,22 @@ export class AuthDbTimeoutError extends Error {
  * whatever the auth path's general-purpose timeout happens to be.
  */
 export async function authDbLookup<T>(run: () => Promise<T>, timeoutMsOverride?: number): Promise<T> {
+  return withAuthDbTimeout(() => retryOnTransientDbConnectionError(run), timeoutMsOverride);
+}
+
+/**
+ * The wall-clock half of `authDbLookup`, without the transient-connection
+ * replay. For auth-path database work that must not run twice — an
+ * `activity_log` INSERT, or an operation that already owns its own retry
+ * policy — a replay after a switchover-timed CONNECTION_CLOSED can duplicate
+ * a committed row, so those callers take the bound and skip the replay.
+ */
+export async function withAuthDbTimeout<T>(run: () => Promise<T>, timeoutMsOverride?: number): Promise<T> {
   const timeoutMs = timeoutMsOverride ?? authDbTimeoutMs();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      retryOnTransientDbConnectionError(run),
+      run(),
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => reject(new AuthDbTimeoutError(timeoutMs)), timeoutMs);
       }),

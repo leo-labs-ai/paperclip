@@ -1,4 +1,9 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import tls from "node:tls";
 import postgres from "postgres";
 import { afterEach, describe, expect, it } from "vitest";
 import { socketWithInactivityTimeout } from "./client.js";
@@ -17,6 +22,24 @@ import { socketWithInactivityTimeout } from "./client.js";
  * handles for a network-dropped connection, so the query rejects and the
  * pool reconnects on the next query — no process restart required.
  */
+/** A throwaway self-signed pair so a real TLS handshake can run in-process. */
+function selfSignedLocalhostCert(): { key: string; cert: string } {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-db-tls-"));
+  const keyPath = path.join(dir, "key.pem");
+  const certPath = path.join(dir, "cert.pem");
+  try {
+    execFileSync(
+      "openssl",
+      // prettier-ignore
+      ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", keyPath, "-out", certPath, "-days", "1", "-subj", "/CN=127.0.0.1"],
+      { stdio: "ignore" },
+    );
+    return { key: readFileSync(keyPath, "utf8"), cert: readFileSync(certPath, "utf8") };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 describe("socketWithInactivityTimeout", () => {
   let server: net.Server | null = null;
   const serverSockets: net.Socket[] = [];
@@ -94,6 +117,45 @@ describe("socketWithInactivityTimeout", () => {
     }
     expect(socket.destroyed).toBe(true);
   });
+
+  it("does not destroy a healthy connection once postgres.js wraps it in TLS", async () => {
+    // `sslmode=require` makes postgres.js's `secure()` hand the socket this
+    // factory dialled to `tls.connect({ socket })`. The TLS wrapper takes the
+    // reads over, so the raw socket stops emitting `data` even while bytes
+    // keep arriving — a backstop keyed on those events would expire on a
+    // perfectly healthy connection and fail whatever query is on the wire.
+    const { key, cert } = selfSignedLocalhostCert();
+    const tlsServer = tls.createServer({ key, cert }, (socket) => {
+      socket.on("data", (chunk) => socket.write(chunk));
+      socket.on("error", () => {});
+    });
+    const port = await new Promise<number>((resolve) => {
+      tlsServer.listen(0, "127.0.0.1", () => resolve((tlsServer.address() as net.AddressInfo).port));
+    });
+
+    try {
+      const raw = await socketWithInactivityTimeout(120)({ host: ["127.0.0.1"], port: [port] });
+      raw.on("error", () => {});
+      const secured = tls.connect({ socket: raw, rejectUnauthorized: false });
+      secured.on("error", () => {});
+      await new Promise<void>((resolve, reject) => {
+        secured.once("secureConnect", resolve);
+        secured.once("error", reject);
+      });
+
+      // Exchange encrypted bytes for twice the idle window.
+      for (let i = 0; i < 6; i++) {
+        secured.write("ping");
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+
+      expect(raw.destroyed).toBe(false);
+      expect(secured.destroyed).toBe(false);
+      secured.destroy();
+    } finally {
+      await new Promise((resolve) => tlsServer.close(resolve));
+    }
+  }, 10_000);
 
   it("rejects instead of hanging when the dial never completes", async () => {
     // TEST-NET-1 (RFC 5737) is reserved and unrouted: the SYN either

@@ -355,4 +355,67 @@ describe("errorHandler on a timed-out auth database lookup (HOM-441)", () => {
       vi.useRealTimers();
     }
   });
+
+  it("counts the occurrences a suppressed window stood in for", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2031-01-01T00:00:00.000Z"));
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => {}) as any);
+    try {
+      const req = makeReq();
+      const res = makeRes() as any;
+      const next = vi.fn() as unknown as NextFunction;
+
+      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
+      expect(warnSpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({ suppressedSinceLastLog: 0 }),
+        expect.any(String),
+      );
+
+      for (let i = 0; i < 4; i++) {
+        vi.setSystemTime(new Date(`2031-01-01T00:00:0${i + 1}.000Z`));
+        errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
+      }
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(new Date("2031-01-01T00:00:31.000Z"));
+      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      expect(warnSpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({ suppressedSinceLastLog: 4 }),
+        expect.any(String),
+      );
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("attaches no error context, and marks the response so the access log stays at warn level", () => {
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => {}) as any);
+    try {
+      const req = makeReq();
+      const res = makeRes() as any;
+      const next = vi.fn() as unknown as NextFunction;
+
+      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
+
+      expect(res.__errorContext).toBeUndefined();
+      expect(res.err).toBeUndefined();
+      expect(res.__transientServiceUnavailable).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("keeps every other 500-class error on the crash-reporting path", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+
+    errorHandler(new HttpError(503, "Database is unreachable"), req, res, next);
+
+    expect(res.__transientServiceUnavailable).toBeUndefined();
+    expect(res.__errorContext).toBeDefined();
+    expect(captureExceptionMock).toHaveBeenCalledTimes(1);
+  });
 });

@@ -152,6 +152,12 @@ export function createHttpLogger(baseLogger: Logger) {
       if (shouldSilenceHttpSuccessLog(_req.method, _req.url, res.statusCode)) {
         return "silent";
       }
+      // A 503 the error handler already classified as a known-transient
+      // database failover (see `__transientServiceUnavailable` in
+      // error-handler.ts) is a warning, not an error: it carries no crash
+      // report and no error context, and during a switchover it would
+      // otherwise put one error-level line in the access log per request.
+      if ((res as any).__transientServiceUnavailable) return "warn";
       if (err || res.statusCode >= 500) return "error";
       if (res.statusCode >= 400) return "warn";
       return "info";
