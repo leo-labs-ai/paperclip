@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 import { AuthDbTimeoutError } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { logger } from "../middleware/logger.js";
 
 const recordResponsibleUserDenialOnActiveRunMock = vi.hoisted(() => vi.fn());
 const captureExceptionMock = vi.hoisted(() => vi.fn());
@@ -314,5 +315,44 @@ describe("errorHandler on a timed-out auth database lookup (HOM-441)", () => {
       code: "AUTH_DB_TIMEOUT",
       details: { code: "AUTH_DB_TIMEOUT" },
     });
+  });
+
+  it("does not report a crash, and rate-limits its warn log to once per window", () => {
+    // A far-future system time keeps this test's own rate-limit window
+    // (a module-level timestamp shared across every call in the process)
+    // independent of whatever real wall-clock time other tests in this file
+    // already advanced it to.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => {}) as any);
+    try {
+      const req = makeReq();
+      const res = makeRes() as any;
+      const next = vi.fn() as unknown as NextFunction;
+
+      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
+      expect(captureExceptionMock).not.toHaveBeenCalled();
+      expect(telemetryMocks.trackErrorHandlerCrash).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error) }),
+        expect.stringContaining("not a crash"),
+      );
+
+      // Still inside the rate-limit window: no second warn log.
+      vi.setSystemTime(new Date("2030-01-01T00:00:10.000Z"));
+      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+
+      // Past the window: logs again.
+      vi.setSystemTime(new Date("2030-01-01T00:00:31.000Z"));
+      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      expect(captureExceptionMock).not.toHaveBeenCalled();
+      expect(telemetryMocks.trackErrorHandlerCrash).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });

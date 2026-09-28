@@ -91,6 +91,30 @@ function reportCrash(error: Error): void {
   captureException(error);
 }
 
+const AUTH_DB_TIMEOUT_WARN_INTERVAL_MS = 30_000;
+let lastAuthDbTimeoutWarnAt = 0;
+
+/**
+ * `AUTH_DB_TIMEOUT` (see `AuthDbTimeoutError` in middleware/auth.ts) means a
+ * Bearer/agent-key auth DB lookup hit its bound -- the expected, transient
+ * shape of a database failover in progress, not a server bug. A CloudNativePG
+ * primary switchover can make every in-flight auth request hit this at once,
+ * and `reportCrash()` (Sentry + telemetry) firing once per request would
+ * flood those sinks with a burst of identical, non-actionable crash events at
+ * exactly the moment an operator needs real signal, instead of the ordinary
+ * traffic-shaped signal a transient 503 should produce. A rate-limited warn
+ * log still leaves a paper trail without the flood.
+ */
+function logAuthDbTimeoutWarning(error: Error): void {
+  const now = Date.now();
+  if (now - lastAuthDbTimeoutWarnAt < AUTH_DB_TIMEOUT_WARN_INTERVAL_MS) return;
+  lastAuthDbTimeoutWarnAt = now;
+  logger.warn(
+    { err: error },
+    "auth database lookup timed out (503) -- reported as a warning, not a crash, because this is the expected shape of an in-progress failover",
+  );
+}
+
 function getPaperclipDb(req: Request): Db | null {
   const locals = req.app?.locals as { paperclipDb?: Db; db?: Db } | undefined;
   return locals?.paperclipDb ?? locals?.db ?? null;
@@ -188,7 +212,11 @@ export function errorHandler(
             },
         reportableError,
       );
-      reportCrash(reportableError);
+      if (details?.code === "AUTH_DB_TIMEOUT") {
+        logAuthDbTimeoutWarning(reportableError);
+      } else {
+        reportCrash(reportableError);
+      }
     }
     const secretSensitiveServerError =
       err.status >= 500 &&
