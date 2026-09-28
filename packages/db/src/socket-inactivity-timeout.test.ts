@@ -290,6 +290,56 @@ describe("a postgres.js client reconnects through a socket left dead by a silent
     expect(started.connectionCount()).toBeGreaterThanOrEqual(2);
   }, 15_000);
 
+  it("still sends TLS SNI for a non-IP host when the custom socket factory dials", async () => {
+    // postgres.js derives the handshake's `servername` from `socket.host`,
+    // which it sets on its own dial branch -- a branch the custom-socket
+    // contract skips. An endpoint that routes on SNI (Neon, Supavisor, an
+    // SNI-based ingress in front of the cluster) refuses a handshake that
+    // carries none, so the factory has to supply it.
+    const { key, cert } = selfSignedLocalhostCert();
+    const secureContext = tls.createSecureContext({ key, cert });
+    let sniServername: string | false | null = null;
+
+    server = net.createServer((raw) => {
+      raw.on("error", () => {});
+      raw.once("data", () => {
+        // SSLRequest: 'S' accepts, then the same socket carries the handshake.
+        raw.write(Buffer.from("S"));
+        const secured = new tls.TLSSocket(raw, { isServer: true, secureContext });
+        secured.on("error", () => {});
+        secured.once("secure", () => {
+          sniServername = secured.servername;
+        });
+        let greeted = false;
+        secured.on("data", () => {
+          if (!greeted) {
+            greeted = true;
+            secured.write(Buffer.concat([authOk, readyForQuery]));
+            return;
+          }
+          secured.write(Buffer.concat([emptyQueryReply, readyForQuery]));
+        });
+      });
+    });
+    // Bind every interface so the literal host `localhost` resolves onto it
+    // whichever family the resolver prefers.
+    const port = await new Promise<number>((resolve) => {
+      server!.listen(0, () => resolve((server!.address() as net.AddressInfo).port));
+    });
+
+    sql = postgres(`postgres://test:test@localhost:${port}/test`, {
+      ssl: { rejectUnauthorized: false },
+      connect_timeout: 5,
+      prepare: false,
+      max: 1,
+      idle_timeout: 0,
+      socket: socketWithInactivityTimeout(5_000, 2_000),
+    } as postgres.Options<Record<string, never>>);
+
+    await expect(sql.unsafe("select 1", [])).resolves.toBeDefined();
+    expect(sniServername).toBe("localhost");
+  }, 15_000);
+
   it("reclaims the pool slot after a pre-connect dial failure instead of leaking it forever", async () => {
     // Grab an ephemeral port and immediately stop listening on it: the next
     // connect attempt against it gets ECONNREFUSED, which is the pre-connect

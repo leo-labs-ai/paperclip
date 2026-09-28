@@ -412,7 +412,16 @@ export function socketWithInactivityTimeout(
   return (target) =>
     new Promise((resolve, reject) => {
       let settled = false;
-      const socket = net.connect({ host: target.host[0], port: target.port[0] }, () => settle(null));
+      const socket = net.connect({ host: target.host[0], port: target.port[0] }, () =>
+        settle(null),
+      ) as net.Socket & { host?: string; port?: number };
+      // postgres.js assigns these itself on its own dial branch and reads them
+      // back in `secure()` as `servername: net.isIP(socket.host) ? undefined :
+      // socket.host`. A custom factory returns before that branch runs, so
+      // without this the TLS handshake carries no SNI — and an endpoint that
+      // routes on SNI (Neon, Supavisor) rejects the connection outright.
+      socket.host = target.host[0];
+      socket.port = target.port[0];
 
       // Every path out of the dial has to settle this promise. postgres.js
       // awaits it inside `connect()` and only attaches its own `close`/
