@@ -35,7 +35,6 @@ describe("databaseClientOptionsFromEnv", () => {
       connect_timeout: DEFAULT_DB_CONNECT_TIMEOUT_SEC,
       max_lifetime: DEFAULT_DB_MAX_LIFETIME_SEC,
       keep_alive: DEFAULT_DB_KEEPALIVE_SEC,
-      socket: expect.any(Function),
       connection: {
         statement_timeout: DEFAULT_DB_STATEMENT_TIMEOUT_MS,
         idle_in_transaction_session_timeout: DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS,
@@ -145,7 +144,6 @@ describe("resolveDatabaseClientOptions", () => {
       connect_timeout: DEFAULT_DB_CONNECT_TIMEOUT_SEC,
       max_lifetime: DEFAULT_DB_MAX_LIFETIME_SEC,
       keep_alive: DEFAULT_DB_KEEPALIVE_SEC,
-      socket: expect.any(Function),
       connection: {
         statement_timeout: DEFAULT_DB_STATEMENT_TIMEOUT_MS,
         idle_in_transaction_session_timeout: DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS,
@@ -176,6 +174,13 @@ describe("postgresJsOptions HA-failover wiring (HOM-441)", () => {
     const options = databaseClientOptionsFromEnv({ PAPERCLIP_DB_CONNECT_TIMEOUT_SEC: "0" });
     expect(options.connectTimeoutSeconds).toBe(0);
     expect(postgresJsOptions(options)).not.toHaveProperty("connect_timeout");
+  });
+
+  it("keeps the driver's own dial when no connection string is supplied", () => {
+    // Without a URL the host count cannot be checked, and the custom factory
+    // only ever dials host[0] -- installing it on an unverified target would
+    // silently disable the driver's multi-host rotation.
+    expect(postgresJsOptions(databaseClientOptionsFromEnv({}))).not.toHaveProperty("socket");
   });
 
   it("keeps the driver's own dial for a multi-host connection string", () => {

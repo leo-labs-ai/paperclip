@@ -529,7 +529,8 @@ export function connectionUrlHostCount(url: string): number {
  * a multi-host connection string keeps the driver's own dial (and with it
  * its per-connection host rotation, which the custom-socket branch of
  * `connect()` skips), so it keeps the OS-keepalive layer as its only
- * failover backstop. Omitted means single-host.
+ * failover backstop. Omitted means the host count cannot be verified, which
+ * keeps the driver's dial for the same reason.
  */
 export function postgresJsOptions(options: DatabaseClientOptions, url?: string): Record<string, unknown> {
   const driverOptions: Record<string, unknown> = {};
@@ -546,7 +547,7 @@ export function postgresJsOptions(options: DatabaseClientOptions, url?: string):
     driverOptions.max_lifetime = options.maxLifetimeSeconds;
   }
   if (options.keepAliveSeconds !== undefined) driverOptions.keep_alive = options.keepAliveSeconds;
-  const singleHost = url === undefined || connectionUrlHostCount(url) === 1;
+  const singleHost = url !== undefined && connectionUrlHostCount(url) === 1;
   if (options.socketTimeoutMs !== undefined && options.socketTimeoutMs > 0 && singleHost) {
     const connectTimeoutMs =
       options.connectTimeoutSeconds !== undefined && options.connectTimeoutSeconds > 0

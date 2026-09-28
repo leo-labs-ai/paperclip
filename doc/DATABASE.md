@@ -214,14 +214,20 @@ auth request itself:
 
 `PAPERCLIP_DB_SOCKET_TIMEOUT_MS` is implemented via a custom postgres.js `socket` factory
 (`socketWithInactivityTimeout` in `packages/db/src/client.ts`) since there is no native
-driver option for it. That factory is installed only for a **single-host** `DATABASE_URL`:
+driver option for it. That factory is installed only when the connection string is available to check *and* is
+**single-host**:
 postgres.js's custom-socket branch skips its own dial, and with it the per-connection host
 rotation (`hostIndex`) a comma-separated multi-host connection string relies on — a factory
 shared by the whole pool cannot reproduce a per-connection cursor without scattering fresh
 connections across hosts that may still be standbys. A multi-host URL therefore keeps the
 driver's dial, its rotation, and OS keepalive (`PAPERCLIP_DB_KEEPALIVE_SEC`) plus
 `PAPERCLIP_AUTH_DB_TIMEOUT_MS` as its failover backstops; the lue-kube topology this was
-written for uses the single rw service, so it gets all three layers. See `packages/db/src/socket-inactivity-timeout.test.ts` for a
+written for uses the single rw service, so it gets all three layers. A caller that builds
+driver options without passing the URL (the host count cannot be verified) likewise keeps
+the driver's dial rather than assuming a single host. Because postgres.js's own dial is the
+branch that sets `socket.host` — which `secure()` reads back as the TLS handshake's
+`servername` — the factory sets `host`/`port` on the socket it returns, so SNI still reaches
+an endpoint that routes on it (Neon, Supavisor, an SNI-based ingress). See `packages/db/src/socket-inactivity-timeout.test.ts` for a
 simulated-failover regression test (a fake wire-protocol TCP server that completes the
 startup handshake and then goes silent, standing in for the dead switchover peer) and
 `server/src/__tests__/auth-db-lookup.test.ts` for the same scenario proven bounded at the
