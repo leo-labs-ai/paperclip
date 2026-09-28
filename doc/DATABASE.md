@@ -258,6 +258,13 @@ retryable 503, not as an expired cookie that logs every board user out. `resolve
 replay, and replaying a committed audit INSERT whose reply was lost to the switchover would
 write a second, false row.
 
+The live-events WebSocket upgrade lane (`server/src/realtime/live-events-ws.ts`) reaches the
+same pool on every branch — the trusted-header cloud actor, the better-auth session and the
+role/membership lookups behind it, and the agent-key lookup with its `lastUsedAt` write — so
+`authorizeUpgrade` as a whole takes one `withAuthDbTimeout` bound rather than each resolver
+taking its own. Without it a switchover parks each upgrade socket indefinitely; with it the
+handler's existing rejection path refuses the upgrade and the browser reconnects.
+
 A request whose auth lookup hits `PAPERCLIP_AUTH_DB_TIMEOUT_MS` answers
 `503 {"error": …, "code": "AUTH_DB_TIMEOUT"}`, not a generic 500, so a caller (and anything
 watching the API) can tell a transiently unreachable database from a server bug and retry.
