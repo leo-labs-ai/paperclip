@@ -91,11 +91,6 @@ function reportCrash(error: Error): void {
   captureException(error);
 }
 
-const AUTH_DB_TIMEOUT_WARN_INTERVAL_MS = 30_000;
-let lastAuthDbTimeoutWarnAt = 0;
-let suppressedAuthDbTimeouts = 0;
-let authDbTimeoutFlushTimer: ReturnType<typeof setTimeout> | null = null;
-
 /**
  * `AUTH_DB_TIMEOUT` (see `AuthDbTimeoutError` in middleware/auth.ts) means a
  * Bearer/agent-key auth DB lookup hit its bound -- the expected, transient
@@ -104,45 +99,13 @@ let authDbTimeoutFlushTimer: ReturnType<typeof setTimeout> | null = null;
  * and `reportCrash()` (Sentry + telemetry) firing once per request would
  * flood those sinks with a burst of identical, non-actionable crash events at
  * exactly the moment an operator needs real signal, instead of the ordinary
- * traffic-shaped signal a transient 503 should produce. A rate-limited warn
- * log still leaves a paper trail without the flood. The line each window does
- * emit carries the number of occurrences it stands in for, so the magnitude of
- * a failover stays legible: one timed-out request and a thousand must not look
- * identical in the logs.
+ * traffic-shaped signal a transient 503 should produce.
  */
-function emitAuthDbTimeoutWarning(error: Error): void {
-  const suppressedSinceLastLog = suppressedAuthDbTimeouts;
-  suppressedAuthDbTimeouts = 0;
-  lastAuthDbTimeoutWarnAt = Date.now();
+function logAuthDbTimeoutWarning(error: Error): void {
   logger.warn(
-    { err: error, suppressedSinceLastLog },
+    { err: error },
     "auth database lookup timed out (503) -- reported as a warning, not a crash, because this is the expected shape of an in-progress failover",
   );
-}
-
-function logAuthDbTimeoutWarning(error: Error): void {
-  const now = Date.now();
-  const elapsedMs = now - lastAuthDbTimeoutWarnAt;
-  if (elapsedMs < AUTH_DB_TIMEOUT_WARN_INTERVAL_MS) {
-    suppressedAuthDbTimeouts += 1;
-    // A failover is over in seconds, so the requests that would have carried
-    // the count out on a later window usually never arrive. Without this the
-    // burst's tail is silently dropped and a thousand timeouts do look like
-    // one.
-    if (authDbTimeoutFlushTimer === null) {
-      authDbTimeoutFlushTimer = setTimeout(() => {
-        authDbTimeoutFlushTimer = null;
-        if (suppressedAuthDbTimeouts > 0) emitAuthDbTimeoutWarning(error);
-      }, Math.min(AUTH_DB_TIMEOUT_WARN_INTERVAL_MS, Math.max(0, AUTH_DB_TIMEOUT_WARN_INTERVAL_MS - elapsedMs)));
-      authDbTimeoutFlushTimer.unref?.();
-    }
-    return;
-  }
-  if (authDbTimeoutFlushTimer !== null) {
-    clearTimeout(authDbTimeoutFlushTimer);
-    authDbTimeoutFlushTimer = null;
-  }
-  emitAuthDbTimeoutWarning(error);
 }
 
 function getPaperclipDb(req: Request): Db | null {
@@ -229,30 +192,21 @@ export function errorHandler(
     recordResponsibleUserDenialFromHttpError(req, details);
     if (err.status >= 500) {
       const reportableError = sanitizeSecretSensitiveError(req, err);
-      if (details?.code === "AUTH_DB_TIMEOUT") {
-        // Skip the error context (and with it the error-level access-log line
-        // logger.ts derives from a 5xx) for the one condition already known to
-        // be transient: the rate-limited warn below is the whole intended
-        // signal, and attaching per-request context here would just move the
-        // failover flood from Sentry into the log sink.
-        (res as any).__transientServiceUnavailable = true;
-        logAuthDbTimeoutWarning(reportableError);
-      } else {
-        attachErrorContext(
-          req,
-          res,
-          isSecretSensitiveHttpRequest(req.method, req.originalUrl)
-            ? { message: reportableError.message, name: reportableError.name }
-            : {
-                message: err.message,
-                stack: err.stack,
-                name: err.name,
-                details: err.details,
-              },
-          reportableError,
-        );
-        reportCrash(reportableError);
-      }
+      attachErrorContext(
+        req,
+        res,
+        isSecretSensitiveHttpRequest(req.method, req.originalUrl)
+          ? { message: reportableError.message, name: reportableError.name }
+          : {
+              message: err.message,
+              stack: err.stack,
+              name: err.name,
+              details: err.details,
+            },
+        reportableError,
+      );
+      if (details?.code === "AUTH_DB_TIMEOUT") logAuthDbTimeoutWarning(reportableError);
+      else reportCrash(reportableError);
     }
     const secretSensitiveServerError =
       err.status >= 500 &&

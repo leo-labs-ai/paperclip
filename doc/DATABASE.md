@@ -257,15 +257,11 @@ A request whose auth lookup hits `PAPERCLIP_AUTH_DB_TIMEOUT_MS` answers
 watching the API) can tell a transiently unreachable database from a server bug and retry.
 That mapping also keeps a failover from flooding the crash-reporting sinks: `errorHandler`
 (`server/src/middleware/error-handler.ts`) recognizes the `AUTH_DB_TIMEOUT` code and emits a
-rate-limited (once per 30s) `logger.warn` instead of calling `reportCrash` -- Sentry/telemetry
-never see a burst of hundreds of identical, non-actionable crash events for what is an
-expected, transient condition during a switchover. That warn line carries
-`suppressedSinceLastLog`, the number of occurrences the window stood in for, so the scale of
-a failover is still legible; a trailing timer flushes that count once the window closes, so a
-burst that stops before the next window still reports its tail. The same condition also skips `attachErrorContext`, and marks
-the response so the access log records it at warn rather than error level: otherwise the
-flood would simply move from Sentry into the log sink, one error-level line per affected
-request. Every other 500-class error keeps the unchanged error context and crash report.
+`logger.warn` instead of calling `reportCrash` -- Sentry/telemetry never see a burst of
+hundreds of identical, non-actionable crash events for what is an expected, transient
+condition during a switchover. Everything else is unchanged: one warn line per occurrence,
+the usual error context, and the usual access-log level. Every other 500-class error keeps
+the unchanged crash report as well.
 
 A pre-connect dial failure through `socketWithInactivityTimeout` (a refused connection, or
 the factory's own `connectTimeoutMs` firing) is also patched at the postgres.js level

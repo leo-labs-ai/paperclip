@@ -317,13 +317,7 @@ describe("errorHandler on a timed-out auth database lookup (HOM-441)", () => {
     });
   });
 
-  it("does not report a crash, and rate-limits its warn log to once per window", () => {
-    // A far-future system time keeps this test's own rate-limit window
-    // (a module-level timestamp shared across every call in the process)
-    // independent of whatever real wall-clock time other tests in this file
-    // already advanced it to.
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+  it("logs a warning per occurrence and reports no crash", () => {
     const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => {}) as any);
     try {
       const req = makeReq();
@@ -331,113 +325,15 @@ describe("errorHandler on a timed-out auth database lookup (HOM-441)", () => {
       const next = vi.fn() as unknown as NextFunction;
 
       errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
+      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
+
       expect(captureExceptionMock).not.toHaveBeenCalled();
       expect(telemetryMocks.trackErrorHandlerCrash).not.toHaveBeenCalled();
-      expect(warnSpy).toHaveBeenCalledTimes(1);
-      expect(warnSpy).toHaveBeenCalledWith(
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      expect(warnSpy).toHaveBeenLastCalledWith(
         expect.objectContaining({ err: expect.any(Error) }),
         expect.stringContaining("not a crash"),
       );
-
-      // Still inside the rate-limit window: no second warn log.
-      vi.setSystemTime(new Date("2030-01-01T00:00:10.000Z"));
-      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
-      expect(warnSpy).toHaveBeenCalledTimes(1);
-
-      // Past the window: logs again.
-      vi.setSystemTime(new Date("2030-01-01T00:00:31.000Z"));
-      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
-      expect(warnSpy).toHaveBeenCalledTimes(2);
-      expect(captureExceptionMock).not.toHaveBeenCalled();
-      expect(telemetryMocks.trackErrorHandlerCrash).not.toHaveBeenCalled();
-    } finally {
-      warnSpy.mockRestore();
-      vi.useRealTimers();
-    }
-  });
-
-  it("counts the occurrences a suppressed window stood in for", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2031-01-01T00:00:00.000Z"));
-    const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => {}) as any);
-    try {
-      const req = makeReq();
-      const res = makeRes() as any;
-      const next = vi.fn() as unknown as NextFunction;
-
-      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
-      expect(warnSpy).toHaveBeenLastCalledWith(
-        expect.objectContaining({ suppressedSinceLastLog: 0 }),
-        expect.any(String),
-      );
-
-      for (let i = 0; i < 4; i++) {
-        vi.setSystemTime(new Date(`2031-01-01T00:00:0${i + 1}.000Z`));
-        errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
-      }
-      expect(warnSpy).toHaveBeenCalledTimes(1);
-
-      vi.setSystemTime(new Date("2031-01-01T00:00:31.000Z"));
-      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
-      expect(warnSpy).toHaveBeenCalledTimes(2);
-      expect(warnSpy).toHaveBeenLastCalledWith(
-        expect.objectContaining({ suppressedSinceLastLog: 4 }),
-        expect.any(String),
-      );
-    } finally {
-      warnSpy.mockRestore();
-      vi.useRealTimers();
-    }
-  });
-
-  it("flushes the suppressed count when the burst stops instead of losing it", async () => {
-    // A switchover produces its whole burst in a few seconds and then stops,
-    // so the request that would have carried the count out on the next window
-    // never arrives.
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2032-01-01T00:00:00.000Z"));
-    const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => {}) as any);
-    try {
-      const req = makeReq();
-      const res = makeRes() as any;
-      const next = vi.fn() as unknown as NextFunction;
-
-      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
-      for (let i = 0; i < 3; i++) {
-        await vi.advanceTimersByTimeAsync(1_000);
-        errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
-      }
-      expect(warnSpy).toHaveBeenCalledTimes(1);
-
-      await vi.advanceTimersByTimeAsync(30_000);
-
-      expect(warnSpy).toHaveBeenCalledTimes(2);
-      expect(warnSpy).toHaveBeenLastCalledWith(
-        expect.objectContaining({ suppressedSinceLastLog: 3 }),
-        expect.any(String),
-      );
-
-      // Nothing further is emitted once the count has been flushed.
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(warnSpy).toHaveBeenCalledTimes(2);
-    } finally {
-      warnSpy.mockRestore();
-      vi.useRealTimers();
-    }
-  });
-
-  it("attaches no error context, and marks the response so the access log stays at warn level", () => {
-    const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => {}) as any);
-    try {
-      const req = makeReq();
-      const res = makeRes() as any;
-      const next = vi.fn() as unknown as NextFunction;
-
-      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
-
-      expect(res.__errorContext).toBeUndefined();
-      expect(res.err).toBeUndefined();
-      expect(res.__transientServiceUnavailable).toBe(true);
     } finally {
       warnSpy.mockRestore();
     }
@@ -450,7 +346,6 @@ describe("errorHandler on a timed-out auth database lookup (HOM-441)", () => {
 
     errorHandler(new HttpError(503, "Database is unreachable"), req, res, next);
 
-    expect(res.__transientServiceUnavailable).toBeUndefined();
     expect(res.__errorContext).toBeDefined();
     expect(captureExceptionMock).toHaveBeenCalledTimes(1);
   });
