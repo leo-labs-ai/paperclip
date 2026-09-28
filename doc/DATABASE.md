@@ -239,6 +239,37 @@ serve.
 A Bearer/agent-key request whose auth lookup hits `PAPERCLIP_AUTH_DB_TIMEOUT_MS` answers
 `503 {"error": …, "code": "AUTH_DB_TIMEOUT"}`, not a generic 500, so a caller (and anything
 watching the API) can tell a transiently unreachable database from a server bug and retry.
+That mapping also keeps a failover from flooding the crash-reporting sinks: `errorHandler`
+(`server/src/middleware/error-handler.ts`) recognizes the `AUTH_DB_TIMEOUT` code and emits a
+rate-limited (once per 30s) `logger.warn` instead of calling `reportCrash` -- Sentry/telemetry
+never see a burst of hundreds of identical, non-actionable crash events for what is an
+expected, transient condition during a switchover.
+
+A pre-connect dial failure through `socketWithInactivityTimeout` (a refused connection, or
+the factory's own `connectTimeoutMs` firing) is also patched at the postgres.js level
+(`patches/postgres@3.4.9.patch`, `createSocket()` in `connection.js`): the driver's stock
+behavior on a rejected custom-socket-factory promise only rejects the pending query and
+never moves the connection out of its internal `connecting` queue, permanently stranding
+one pool slot per failed dial. Enough failed dials exhausts `max` and reproduces the same
+hang this whole change exists to eliminate, just at connection-open time instead of query
+time. The patch calls postgres.js's own `onclose` in that catch branch so the pool retries
+the connection on its next query instead of leaking the slot; see the pre-connect dial
+failure test in `packages/db/src/socket-inactivity-timeout.test.ts`.
+
+**Known limitation:** a connection that goes silent *after* a query is already in flight on
+it (the core HOM-441 scenario) is not proactively destroyed the moment `authDbLookup` times
+out on that query -- the losing attempt is simply abandoned, and the connection stays parked
+in postgres.js's pool as "busy" until `PAPERCLIP_DB_SOCKET_TIMEOUT_MS`'s read-idle backstop
+fires on it independently (worst case, with defaults, ~5.5 minutes: `statement_timeout` +
+`DB_SOCKET_TIMEOUT_MARGIN_MS`). Every *caller* is still bounded by `authDbLookup` at
+`PAPERCLIP_AUTH_DB_TIMEOUT_MS` regardless -- no request ever hangs -- but a pool whose `max`
+is close to its steady-state concurrency could see a string of requests each draw one of
+these not-yet-reclaimed connections and time out in turn, before the backstop catches up.
+Actively destroying and replacing that one connection the moment its auth lookup times out
+would close this window, but doing so safely requires either threading a dedicated
+auth-path connection (and its own lifecycle) through every `authDbLookup` call site, or a
+registry mapping in-flight lookups back to the specific pooled connection they landed on --
+both larger than this fix's scope. Tracked as a follow-up.
 
 ## Migration authoring checklist
 
