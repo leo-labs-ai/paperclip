@@ -157,6 +157,36 @@ describe("socketWithInactivityTimeout", () => {
     }
   }, 10_000);
 
+  it("reclaims a socket within its documented window, not twice it", async () => {
+    // The backstop advertises a single `timeoutMs` window. Sampling the read
+    // counter once per window cannot honour that: whatever the last sample
+    // saw, silence that begins just after it is only noticed a full further
+    // window later, so a connection that dies mid-query survives up to twice
+    // the documented time before the query fails.
+    const timeoutMs = 400;
+    server = net.createServer((socket) => {
+      serverSockets.push(socket);
+      socket.on("error", () => {});
+      socket.write("hello"); // one burst, then silence, like a dead primary
+    });
+    const port = await new Promise<number>((resolve) => {
+      server!.listen(0, "127.0.0.1", () => resolve((server!.address() as net.AddressInfo).port));
+    });
+
+    const socket = await socketWithInactivityTimeout(timeoutMs)({ host: ["127.0.0.1"], port: [port] });
+    socket.on("error", () => {});
+    let lastDataAt = Date.now();
+    socket.on("data", () => {
+      lastDataAt = Date.now();
+    });
+
+    const closedAt = await new Promise<number>((resolve) => socket.once("close", () => resolve(Date.now())));
+    expect(socket.destroyed).toBe(true);
+    const elapsedMs = closedAt - lastDataAt;
+    expect(elapsedMs).toBeGreaterThanOrEqual(timeoutMs * 0.9);
+    expect(elapsedMs).toBeLessThan(timeoutMs * 1.5);
+  }, 10_000);
+
   it("rejects instead of hanging when the dial never completes", async () => {
     // TEST-NET-1 (RFC 5737) is reserved and unrouted: the SYN either
     // blackholes or is refused by the local stack. Either way the factory's

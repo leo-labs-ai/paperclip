@@ -435,11 +435,13 @@ export function socketWithInactivityTimeout(
         socket.removeListener("error", onPreConnectError);
         socket.removeListener("close", onPreConnectClose);
         if (err) {
-          clearTimeout(readIdleTimer);
+          clearInterval(readIdleTimer);
           socket.destroy();
           reject(err);
           return;
         }
+        lastBytesRead = socket.bytesRead;
+        lastReadAt = Date.now();
         resolve(socket);
       }
 
@@ -459,9 +461,15 @@ export function socketWithInactivityTimeout(
             }, connectTimeoutMs).unref()
           : null;
 
-      // Armed from the dial onwards and re-armed only when the socket's read
+      // Armed from the dial onwards and reset only when the socket's read
       // counter has moved, so a stream of outbound writes on a socket whose
       // peer has gone silent cannot postpone it.
+      //
+      // Sampled on a poll a tenth of the window long rather than on one timer
+      // per window: a single timer can only observe the counter when it fires,
+      // so the last sample before real silence starts always looks like
+      // activity and the socket survives a further full window — twice the
+      // documented reclaim time.
       //
       // `bytesRead`, not a `data` listener: once postgres.js's `secure()`
       // hands this socket to `tls.connect({ socket })`, the TLS wrapper takes
@@ -472,17 +480,20 @@ export function socketWithInactivityTimeout(
       // TLS wrap, which makes the same "nothing read from the peer" question
       // answerable on plaintext and TLS alike.
       let lastBytesRead = 0;
-      const readIdleTimer = setTimeout(onReadIdle, timeoutMs).unref();
-      socket.once("close", () => clearTimeout(readIdleTimer));
+      let lastReadAt = Date.now();
+      const readIdleTimer = setInterval(onReadIdle, Math.max(1, Math.ceil(timeoutMs / 10))).unref();
+      socket.once("close", () => clearInterval(readIdleTimer));
 
       function onReadIdle(): void {
-        if (!settled) {
-          settle(connectionClosed(`Database socket read nothing within ${timeoutMs}ms`));
-          return;
-        }
         if (socket.bytesRead !== lastBytesRead) {
           lastBytesRead = socket.bytesRead;
-          readIdleTimer.refresh();
+          lastReadAt = Date.now();
+          return;
+        }
+        if (Date.now() - lastReadAt < timeoutMs) return;
+        clearInterval(readIdleTimer);
+        if (!settled) {
+          settle(connectionClosed(`Database socket read nothing within ${timeoutMs}ms`));
           return;
         }
         // Destroy with no error argument. postgres.js's own `closed(hadError)`
