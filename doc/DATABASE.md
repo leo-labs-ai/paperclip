@@ -274,8 +274,11 @@ never moves the connection out of its internal `connecting` queue, permanently s
 one pool slot per failed dial. Enough failed dials exhausts `max` and reproduces the same
 hang this whole change exists to eliminate, just at connection-open time instead of query
 time. The patch calls postgres.js's own `onclose` in that catch branch so the pool retries
-the connection on its next query instead of leaking the slot; see the pre-connect dial
-failure test in `packages/db/src/socket-inactivity-timeout.test.ts`.
+the connection on its next query instead of leaking the slot, and records the failed dial
+through the same `closedTime`/`retries`/`delay` bookkeeping `closed()` uses, so reconnect
+backoff still accumulates instead of re-dialling a refusing primary in a tight loop; see
+the pre-connect dial failure and backoff tests in
+`packages/db/src/socket-inactivity-timeout.test.ts`.
 
 **No per-request auth budget.** `PAPERCLIP_AUTH_DB_TIMEOUT_MS` bounds one lookup, so a
 request that makes several sequential lookups is bounded by their sum. The longest branch is

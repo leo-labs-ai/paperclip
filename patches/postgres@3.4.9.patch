@@ -1,8 +1,8 @@
 diff --git a/cf/src/connection.js b/cf/src/connection.js
-index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..29b10bedb0fb8a5bbb4e26325dd85ac6167a4a02 100644
+index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..0950c3ebaf1f078ec04571feeceeca4ca40e2c71 100644
 --- a/cf/src/connection.js
 +++ b/cf/src/connection.js
-@@ -135,7 +135,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -135,7 +135,25 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
          ? (await Promise.resolve(options.socket(options)))
          : new net.Socket()
      } catch (e) {
@@ -23,11 +23,12 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..29b10bedb0fb8a5bbb4e26325dd85ac6
 +      // connection back to `closed` so the pool can retry it on the next
 +      // query.
        error(e)
++      recordClosedForBackoff(true)
 +      onclose(connection, e)
        return
      }
      x.on('error', error)
-@@ -254,8 +271,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -254,8 +272,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function nextWrite(fn) {
@@ -53,7 +54,7 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..29b10bedb0fb8a5bbb4e26325dd85ac6
      chunk = nextWriteTimer = null
      return x
    }
-@@ -427,6 +460,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -427,6 +461,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        error(Errors.connection('CONNECTION_DESTROYED', options))
  
      clearImmediate(nextWriteTimer)
@@ -61,7 +62,7 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..29b10bedb0fb8a5bbb4e26325dd85ac6
      if (socket) {
        socket.removeListener('data', data)
        socket.removeListener('connect', connected)
-@@ -440,6 +474,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -440,6 +475,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      remaining = 0
      incomings = null
      clearImmediate(nextWriteTimer)
@@ -69,11 +70,34 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..29b10bedb0fb8a5bbb4e26325dd85ac6
      socket.removeListener('data', data)
      socket.removeListener('connect', connected)
      idleTimer.cancel()
+@@ -453,10 +489,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+       return reconnect()
+ 
+     !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
++    recordClosedForBackoff(hadError)
++    onclose(connection, Errors.connection('CONNECTION_CLOSED', options, socket))
++  }
++
++  // PATCH HOM-441 (paperclip): `reconnect()` waits `closedTime + delay`, and
++  // `closedTime`/`delay`/`options.shared.retries` used to be set here only.
++  // The pre-connect socket-factory failure branch in `createSocket()` has to
++  // account for its failed dial the same way -- sharing this function instead
++  // of repeating the three lines keeps the two paths from drifting -- or
++  // every re-dial after such a failure fires with zero delay and backoff
++  // never accumulates.
++  function recordClosedForBackoff(hadError) {
+     closedTime = performance.now()
+     hadError && options.shared.retries++
+     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
+-    onclose(connection, Errors.connection('CONNECTION_CLOSED', options, socket))
+   }
+ 
+   /* Handlers */
 diff --git a/cjs/src/connection.js b/cjs/src/connection.js
-index 07f6716702ac888215c86ad6e0071aaf55ae519c..6eabde719a3b4703c6513cf3aaff246265e90543 100644
+index 07f6716702ac888215c86ad6e0071aaf55ae519c..86b54d66674d237e073a5207dc26ffa5cb4c6fb1 100644
 --- a/cjs/src/connection.js
 +++ b/cjs/src/connection.js
-@@ -133,7 +133,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -133,7 +133,25 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
          ? (await Promise.resolve(options.socket(options)))
          : new net.Socket()
      } catch (e) {
@@ -94,11 +118,12 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..6eabde719a3b4703c6513cf3aaff2462
 +      // connection back to `closed` so the pool can retry it on the next
 +      // query.
        error(e)
++      recordClosedForBackoff(true)
 +      onclose(connection, e)
        return
      }
      x.on('error', error)
-@@ -252,8 +269,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -252,8 +270,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function nextWrite(fn) {
@@ -124,7 +149,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..6eabde719a3b4703c6513cf3aaff2462
      chunk = nextWriteTimer = null
      return x
    }
-@@ -425,6 +458,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -425,6 +459,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        error(Errors.connection('CONNECTION_DESTROYED', options))
  
      clearImmediate(nextWriteTimer)
@@ -132,7 +157,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..6eabde719a3b4703c6513cf3aaff2462
      if (socket) {
        socket.removeListener('data', data)
        socket.removeListener('connect', connected)
-@@ -438,6 +472,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -438,6 +473,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      remaining = 0
      incomings = null
      clearImmediate(nextWriteTimer)
@@ -140,11 +165,34 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..6eabde719a3b4703c6513cf3aaff2462
      socket.removeListener('data', data)
      socket.removeListener('connect', connected)
      idleTimer.cancel()
+@@ -451,10 +487,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+       return reconnect()
+ 
+     !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
++    recordClosedForBackoff(hadError)
++    onclose(connection, Errors.connection('CONNECTION_CLOSED', options, socket))
++  }
++
++  // PATCH HOM-441 (paperclip): `reconnect()` waits `closedTime + delay`, and
++  // `closedTime`/`delay`/`options.shared.retries` used to be set here only.
++  // The pre-connect socket-factory failure branch in `createSocket()` has to
++  // account for its failed dial the same way -- sharing this function instead
++  // of repeating the three lines keeps the two paths from drifting -- or
++  // every re-dial after such a failure fires with zero delay and backoff
++  // never accumulates.
++  function recordClosedForBackoff(hadError) {
+     closedTime = performance.now()
+     hadError && options.shared.retries++
+     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
+-    onclose(connection, Errors.connection('CONNECTION_CLOSED', options, socket))
+   }
+ 
+   /* Handlers */
 diff --git a/src/connection.js b/src/connection.js
-index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..9b7d7f0b79170e47393932a4bbad397c99c9129d 100644
+index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..47b0ac697999fba9442d114adbfe180aa1a0df83 100644
 --- a/src/connection.js
 +++ b/src/connection.js
-@@ -133,7 +133,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -133,7 +133,25 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
          ? (await Promise.resolve(options.socket(options)))
          : new net.Socket()
      } catch (e) {
@@ -165,11 +213,12 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..9b7d7f0b79170e47393932a4bbad397c
 +      // connection back to `closed` so the pool can retry it on the next
 +      // query.
        error(e)
++      recordClosedForBackoff(true)
 +      onclose(connection, e)
        return
      }
      x.on('error', error)
-@@ -252,8 +269,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -252,8 +270,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function nextWrite(fn) {
@@ -195,7 +244,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..9b7d7f0b79170e47393932a4bbad397c
      chunk = nextWriteTimer = null
      return x
    }
-@@ -425,6 +458,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -425,6 +459,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        error(Errors.connection('CONNECTION_DESTROYED', options))
  
      clearImmediate(nextWriteTimer)
@@ -203,7 +252,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..9b7d7f0b79170e47393932a4bbad397c
      if (socket) {
        socket.removeListener('data', data)
        socket.removeListener('connect', connected)
-@@ -438,6 +472,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -438,6 +473,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      remaining = 0
      incomings = null
      clearImmediate(nextWriteTimer)
@@ -211,3 +260,26 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..9b7d7f0b79170e47393932a4bbad397c
      socket.removeListener('data', data)
      socket.removeListener('connect', connected)
      idleTimer.cancel()
+@@ -451,10 +487,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+       return reconnect()
+ 
+     !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
++    recordClosedForBackoff(hadError)
++    onclose(connection, Errors.connection('CONNECTION_CLOSED', options, socket))
++  }
++
++  // PATCH HOM-441 (paperclip): `reconnect()` waits `closedTime + delay`, and
++  // `closedTime`/`delay`/`options.shared.retries` used to be set here only.
++  // The pre-connect socket-factory failure branch in `createSocket()` has to
++  // account for its failed dial the same way -- sharing this function instead
++  // of repeating the three lines keeps the two paths from drifting -- or
++  // every re-dial after such a failure fires with zero delay and backoff
++  // never accumulates.
++  function recordClosedForBackoff(hadError) {
+     closedTime = performance.now()
+     hadError && options.shared.retries++
+     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
+-    onclose(connection, Errors.connection('CONNECTION_CLOSED', options, socket))
+   }
+ 
+   /* Handlers */

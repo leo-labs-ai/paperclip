@@ -370,6 +370,51 @@ describe("a postgres.js client reconnects through a socket left dead by a silent
     expect(sniServername).toBe("localhost");
   }, 15_000);
 
+  it("backs off between re-dials after repeated pre-connect failures", async () => {
+    // A failed dial has to be accounted for the same way a closed connection
+    // is (`closedTime`, `options.shared.retries`, `delay`), because that
+    // bookkeeping is the only input to `reconnect()`'s wait. Without it every
+    // queued query re-dials the refused primary immediately, so a switchover
+    // that leaves the old primary refusing connections turns into a tight
+    // reconnect loop against it.
+    const probe = net.createServer();
+    const port = await new Promise<number>((resolve) => {
+      probe.listen(0, "127.0.0.1", () => resolve((probe.address() as net.AddressInfo).port));
+    });
+    await new Promise((resolve) => probe.close(resolve));
+
+    const dialedAt: number[] = [];
+    const dial = socketWithInactivityTimeout(5_000, 500);
+    sql = postgres(`postgres://test:test@127.0.0.1:${port}/test`, {
+      connect_timeout: 5,
+      prepare: false,
+      max: 1,
+      idle_timeout: 0,
+      // Seconds, and deterministic: the driver's own default multiplies by a
+      // random factor, which cannot be asserted on.
+      backoff: (retries: number) => retries * 0.05,
+      socket: (target: { host: string[]; port: number[] }) => {
+        dialedAt.push(Date.now());
+        return dial(target);
+      },
+    } as unknown as postgres.Options<Record<string, never>>);
+
+    const results = await Promise.allSettled([
+      sql.unsafe("select 1", []),
+      sql.unsafe("select 1", []),
+      sql.unsafe("select 1", []),
+      sql.unsafe("select 1", []),
+    ]);
+    expect(results.every((r) => r.status === "rejected")).toBe(true);
+
+    expect(dialedAt.length).toBeGreaterThanOrEqual(4);
+    const gaps = dialedAt.slice(1).map((at, i) => at - dialedAt[i]);
+    expect(gaps[0]).toBeGreaterThanOrEqual(35);
+    for (let i = 1; i < gaps.length; i++) {
+      expect(gaps[i]).toBeGreaterThan(gaps[i - 1]);
+    }
+  }, 15_000);
+
   it("reclaims the pool slot after a pre-connect dial failure instead of leaking it forever", async () => {
     // Grab an ephemeral port and immediately stop listening on it: the next
     // connect attempt against it gets ECONNREFUSED, which is the pre-connect
