@@ -623,3 +623,60 @@ describe("GET /health", () => {
     });
   });
 });
+
+describe("GET /health/auth-db", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("reports ready without requiring an actor when the probe query succeeds", async () => {
+    const db = createHealthyDb();
+    const app = createApp(db);
+
+    const res = await request(app).get("/health/auth-db");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: "ready" });
+    expect(db.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports not_ready without a database configured", async () => {
+    const app = createApp(undefined);
+
+    const res = await request(app).get("/health/auth-db");
+
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ status: "not_ready" });
+  });
+
+  it("reports not_ready and does not leak error detail when the probe query fails", async () => {
+    const db = {
+      execute: vi.fn().mockRejectedValue(new Error("write CONNECTION_CLOSED db.internal:5432")),
+    } as unknown as Db;
+    const app = createApp(db);
+
+    const res = await request(app).get("/health/auth-db");
+
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ status: "not_ready" });
+    expect(JSON.stringify(res.body)).not.toMatch(/CONNECTION_CLOSED|db\.internal/);
+  });
+
+  it("reports not_ready within a bounded time when the probe query never settles", async () => {
+    const db = {
+      execute: vi.fn(() => new Promise(() => {})),
+    } as unknown as Db;
+    const app = createApp(db);
+
+    const startedAt = Date.now();
+    const res = await request(app).get("/health/auth-db");
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ status: "not_ready" });
+    // Bounded by the probe's own tighter timeout (HEALTH_DB_PROBE_TIMEOUT_MS,
+    // 3s), not authDbLookup's general-purpose default (5s) — and nowhere near
+    // "forever".
+    expect(elapsedMs).toBeLessThan(4_000);
+  }, 6_000);
+});

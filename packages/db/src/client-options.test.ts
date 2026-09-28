@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  DB_SOCKET_TIMEOUT_MARGIN_MS,
   DEFAULT_DATABASE_APPLICATION_NAME,
   DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS,
+  DEFAULT_DB_CONNECT_TIMEOUT_SEC,
   DEFAULT_DB_IDLE_TIMEOUT_SEC,
   DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS,
+  DEFAULT_DB_KEEPALIVE_SEC,
   DEFAULT_DB_MAX_LIFETIME_SEC,
   DEFAULT_DB_STATEMENT_TIMEOUT_MS,
   databaseClientOptionsFromEnv,
@@ -13,12 +16,15 @@ import {
 
 // Fork: when nothing is set, idle/lifetime bounds and session guards default
 // on instead of preserving the driver's unbounded behaviour (CNPG
-// smart-shutdown fix; pool-starvation-503 fix).
+// smart-shutdown fix; pool-starvation-503 fix; HOM-441 failover-reconnect fix).
 const FORK_DEFAULTS = {
   idleTimeoutSeconds: DEFAULT_DB_IDLE_TIMEOUT_SEC,
+  connectTimeoutSeconds: DEFAULT_DB_CONNECT_TIMEOUT_SEC,
   maxLifetimeSeconds: DEFAULT_DB_MAX_LIFETIME_SEC,
   statementTimeoutMs: DEFAULT_DB_STATEMENT_TIMEOUT_MS,
   idleInTransactionTimeoutMs: DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS,
+  keepAliveSeconds: DEFAULT_DB_KEEPALIVE_SEC,
+  socketTimeoutMs: DEFAULT_DB_STATEMENT_TIMEOUT_MS + DB_SOCKET_TIMEOUT_MARGIN_MS,
 };
 
 describe("databaseClientOptionsFromEnv", () => {
@@ -26,7 +32,10 @@ describe("databaseClientOptionsFromEnv", () => {
     expect(databaseClientOptionsFromEnv({})).toEqual(FORK_DEFAULTS);
     expect(postgresJsOptions(databaseClientOptionsFromEnv({}))).toEqual({
       idle_timeout: DEFAULT_DB_IDLE_TIMEOUT_SEC,
+      connect_timeout: DEFAULT_DB_CONNECT_TIMEOUT_SEC,
       max_lifetime: DEFAULT_DB_MAX_LIFETIME_SEC,
+      keep_alive: DEFAULT_DB_KEEPALIVE_SEC,
+      socket: expect.any(Function),
       connection: {
         statement_timeout: DEFAULT_DB_STATEMENT_TIMEOUT_MS,
         idle_in_transaction_session_timeout: DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS,
@@ -66,6 +75,8 @@ describe("databaseClientOptionsFromEnv", () => {
       maxLifetimeSeconds: 1800,
       statementTimeoutMs: DEFAULT_DB_STATEMENT_TIMEOUT_MS,
       idleInTransactionTimeoutMs: DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS,
+      keepAliveSeconds: DEFAULT_DB_KEEPALIVE_SEC,
+      socketTimeoutMs: DEFAULT_DB_STATEMENT_TIMEOUT_MS + DB_SOCKET_TIMEOUT_MARGIN_MS,
       applicationName: "paperclip-web",
     });
   });
@@ -131,7 +142,10 @@ describe("resolveDatabaseClientOptions", () => {
     // timeout and session guards, so only application_name comes from here.
     expect(postgresJsOptions(resolveDatabaseClientOptions(databaseClientOptionsFromEnv({})))).toEqual({
       idle_timeout: DEFAULT_DB_IDLE_TIMEOUT_SEC,
+      connect_timeout: DEFAULT_DB_CONNECT_TIMEOUT_SEC,
       max_lifetime: DEFAULT_DB_MAX_LIFETIME_SEC,
+      keep_alive: DEFAULT_DB_KEEPALIVE_SEC,
+      socket: expect.any(Function),
       connection: {
         statement_timeout: DEFAULT_DB_STATEMENT_TIMEOUT_MS,
         idle_in_transaction_session_timeout: DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS,

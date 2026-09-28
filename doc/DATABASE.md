@@ -197,6 +197,38 @@ determinism, so a pool opened at startup expires together. If you see herd recon
 lengthen `PAPERCLIP_DB_MAX_LIFETIME_SEC` or set it to `0` to fall back to postgres.js's
 jittered default.
 
+### HA-failover connection recovery (HOM-441)
+
+A CloudNativePG primary switchover can leave a pooled connection's TCP session open on the
+client side with neither a FIN nor an RST. The backend never received the in-flight query,
+so PostgreSQL's own `statement_timeout` never fires for it — the client just waits forever
+for a reply that will never come. Three layers close that gap, from the OS socket up to the
+auth request itself:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `PAPERCLIP_DB_KEEPALIVE_SEC` | `15` | postgres.js `keep_alive`: TCP keepalive idle delay before the OS sends the first probe on a pooled socket. `0` disables. How fast the kernel gives up after that first probe depends on `TCP_KEEPINTVL`/`TCP_KEEPCNT`, which Node does not expose per-socket — tuning those is the paired lue-kube (pod `sysctls`) change, not this one. |
+| `PAPERCLIP_DB_SOCKET_TIMEOUT_MS` | derived from `statement_timeout` (comfortably above it; `10` minutes when `statement_timeout` is disabled) | Client-side backstop that does not depend on OS keepalive tuning at all: destroys a pooled socket after this many ms with neither a read nor a write, forcing postgres.js's existing reconnect path to replace it on the next query. `0` disables. |
+| `PAPERCLIP_DB_CONNECT_TIMEOUT_SEC` | `10` | postgres.js `connect_timeout`. The driver default (30s) is tuned for an occasionally-slow network, not a repeatedly-unreachable failed-over primary; a shorter budget means a doomed connection attempt fails, and the next attempt (which may hit a now-healthy replica-turned-primary) starts sooner. `0` restores the driver default. The upstream `DATABASE_CONNECT_TIMEOUT_SECONDS` knob still wins when set. |
+| `PAPERCLIP_AUTH_DB_TIMEOUT_MS` | `5000` | Application-level ceiling on a single Bearer/agent-key auth DB lookup in `server/src/middleware/auth.ts` (`authDbLookup`), including its own transient-connection retries. This is the layer that actually bounds the auth request: a connection recovery attempt that itself lands on another still-unreachable target has no bound of its own inside postgres.js (its handling of a first query on a brand-new connection retries silently until it either succeeds or the process exits), so this timeout is what turns a hung Bearer/agent-key request into a fast, clear failure instead of an indefinite hang. |
+
+`PAPERCLIP_DB_SOCKET_TIMEOUT_MS` is implemented via a custom postgres.js `socket` factory
+(`socketWithInactivityTimeout` in `packages/db/src/client.ts`) since there is no native
+driver option for it; see `packages/db/src/socket-inactivity-timeout.test.ts` for a
+simulated-failover regression test (a fake wire-protocol TCP server that completes the
+startup handshake and then goes silent, standing in for the dead switchover peer) and
+`server/src/__tests__/auth-db-lookup.test.ts` for the same scenario proven bounded at the
+auth layer, including the pathological case where the pool-level backstop's own retry
+lands on a connection that never gives up on its own.
+
+A dedicated, unauthenticated readiness endpoint exercises the same pool the Bearer/agent-key
+auth path draws from: `GET /api/health/auth-db` runs one `SELECT 1` through `authDbLookup`
+(bounded to the existing 3s health-probe timeout, not the general-purpose 5s default above)
+and returns `200 {"status":"ready"}` or `503 {"status":"not_ready"}` with no further detail.
+Wire this path into the k8s `readinessProbe` (paired lue-kube change) so a wedged auth-path
+connection pulls the pod out of rotation instead of continuing to accept traffic it cannot
+serve.
+
 ## Migration authoring checklist
 
 The 0126 issue comment attribution backfill showed the failure mode this checklist is meant to prevent: each batch looked for the next rows with an unindexed predicate, so PostgreSQL repeatedly scanned the same table and the migration became O(n²) as the table grew.

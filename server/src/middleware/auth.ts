@@ -92,17 +92,19 @@ async function resolveLegacyRunResponsibleUserId(
   input: { companyId: string; agentId: string; runId: string },
 ) {
   if (!isUuidLike(input.runId)) return null;
-  const run = await db
-    .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
-    .from(heartbeatRuns)
-    .where(
-      and(
-        eq(heartbeatRuns.id, input.runId),
-        eq(heartbeatRuns.companyId, input.companyId),
-        eq(heartbeatRuns.agentId, input.agentId),
-      ),
-    )
-    .then((rows) => rows[0] ?? null);
+  const run = await authDbLookup(() =>
+    db
+      .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.id, input.runId),
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null),
+  );
   return normalizeOptionalString(run?.responsibleUserId);
 }
 
@@ -110,29 +112,32 @@ async function loadResponsibleUserMemberships(
   db: Db,
   input: { companyId: string; userId: string | null },
 ) {
-  if (!input.userId) return [];
-  const [user, memberships] = await Promise.all([
-    db
-      .select({ id: authUsers.id })
-      .from(authUsers)
-      .where(eq(authUsers.id, input.userId))
-      .then((rows) => rows[0] ?? null),
-    db
-      .select({
-        companyId: companyMemberships.companyId,
-        membershipRole: companyMemberships.membershipRole,
-        status: companyMemberships.status,
-      })
-      .from(companyMemberships)
-      .where(
-        and(
-          eq(companyMemberships.companyId, input.companyId),
-          eq(companyMemberships.principalType, "user"),
-          eq(companyMemberships.principalId, input.userId),
-          eq(companyMemberships.status, "active"),
+  const userId = input.userId;
+  if (!userId) return [];
+  const [user, memberships] = await authDbLookup(() =>
+    Promise.all([
+      db
+        .select({ id: authUsers.id })
+        .from(authUsers)
+        .where(eq(authUsers.id, userId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({
+          companyId: companyMemberships.companyId,
+          membershipRole: companyMemberships.membershipRole,
+          status: companyMemberships.status,
+        })
+        .from(companyMemberships)
+        .where(
+          and(
+            eq(companyMemberships.companyId, input.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, userId),
+            eq(companyMemberships.status, "active"),
+          ),
         ),
-      ),
-  ]);
+    ]),
+  );
   return user ? memberships : [];
 }
 
@@ -163,22 +168,24 @@ async function auditAgentJwtRunHeaderMismatch(
   input: { companyId: string; agentId: string; claimRunId: string; headerRunId: string; method: string; url: string },
 ) {
   try {
-    await db.insert(activityLog).values({
-      companyId: input.companyId,
-      actorType: "agent",
-      actorId: input.agentId,
-      action: "auth.agent_jwt_run_header_mismatch",
-      entityType: "heartbeat_run",
-      entityId: input.claimRunId,
-      ...(isUuidLike(input.agentId) ? { agentId: input.agentId } : {}),
-      ...(isUuidLike(input.claimRunId) ? { runId: input.claimRunId } : {}),
-      details: {
-        claimRunId: input.claimRunId,
-        headerRunId: input.headerRunId,
-        method: input.method,
-        url: input.url,
-      },
-    });
+    await authDbLookup(() =>
+      db.insert(activityLog).values({
+        companyId: input.companyId,
+        actorType: "agent",
+        actorId: input.agentId,
+        action: "auth.agent_jwt_run_header_mismatch",
+        entityType: "heartbeat_run",
+        entityId: input.claimRunId,
+        ...(isUuidLike(input.agentId) ? { agentId: input.agentId } : {}),
+        ...(isUuidLike(input.claimRunId) ? { runId: input.claimRunId } : {}),
+        details: {
+          claimRunId: input.claimRunId,
+          headerRunId: input.headerRunId,
+          method: input.method,
+          url: input.url,
+        },
+      }),
+    );
   } catch (err) {
     logger.warn(
       { err, companyId: input.companyId, agentId: input.agentId, claimRunId: input.claimRunId },
@@ -192,19 +199,21 @@ async function auditAgentKeyMissingResponsibleUser(
   input: { companyId: string; agentId: string; keyId: string; method: string; url: string },
 ) {
   try {
-    await db.insert(activityLog).values({
-      companyId: input.companyId,
-      actorType: "agent",
-      actorId: input.agentId,
-      action: "auth.agent_key_missing_responsible_user",
-      entityType: "agent_api_key",
-      entityId: input.keyId,
-      ...(isUuidLike(input.agentId) ? { agentId: input.agentId } : {}),
-      details: {
-        method: input.method,
-        url: input.url,
-      },
-    });
+    await authDbLookup(() =>
+      db.insert(activityLog).values({
+        companyId: input.companyId,
+        actorType: "agent",
+        actorId: input.agentId,
+        action: "auth.agent_key_missing_responsible_user",
+        entityType: "agent_api_key",
+        entityId: input.keyId,
+        ...(isUuidLike(input.agentId) ? { agentId: input.agentId } : {}),
+        details: {
+          method: input.method,
+          url: input.url,
+        },
+      }),
+    );
   } catch (err) {
     logger.warn(
       { err, companyId: input.companyId, agentId: input.agentId, keyId: input.keyId },
@@ -329,11 +338,11 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
-    const boardKey = await boardAuth.findBoardApiKeyByToken(token);
+    const boardKey = await authDbLookup(() => boardAuth.findBoardApiKeyByToken(token));
     if (boardKey) {
-      const access = await boardAuth.resolveBoardAccess(boardKey.userId);
+      const access = await authDbLookup(() => boardAuth.resolveBoardAccess(boardKey.userId));
       if (access.user) {
-        await boardAuth.touchBoardApiKey(boardKey.id);
+        await authDbLookup(() => boardAuth.touchBoardApiKey(boardKey.id));
         req.actor = {
           type: "board",
           userId: boardKey.userId,
@@ -352,11 +361,13 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     }
 
     const tokenHash = hashToken(token);
-    const key = await db
-      .select()
-      .from(agentApiKeys)
-      .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
-      .then((rows) => rows[0] ?? null);
+    const key = await authDbLookup(() =>
+      db
+        .select()
+        .from(agentApiKeys)
+        .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
+        .then((rows) => rows[0] ?? null),
+    );
 
     if (!key) {
       const claims = verifyLocalAgentJwt(token);
@@ -365,11 +376,13 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
-      const agentRecord = await db
-        .select()
-        .from(agents)
-        .where(eq(agents.id, claims.sub))
-        .then((rows) => rows[0] ?? null);
+      const agentRecord = await authDbLookup(() =>
+        db
+          .select()
+          .from(agents)
+          .where(eq(agents.id, claims.sub))
+          .then((rows) => rows[0] ?? null),
+      );
 
       if (!agentRecord || agentRecord.companyId !== claims.company_id) {
         next(unauthorized("Agent record is missing or belongs to another company; obtain fresh credentials and retry"));
@@ -405,11 +418,13 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
-      const [identityRun] = await db.select({ activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
-        responsibleUserId: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status,
-        contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
-          eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
-        ));
+      const [identityRun] = await authDbLookup(() =>
+        db.select({ activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
+          responsibleUserId: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status,
+          contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
+          )),
+      );
       if (identityRun?.status === "cancelled" && identityRun.contextSnapshot?.conversationMode === true
         && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
         res.status(403).json({ error: "This conversation turn was cancelled", code: "conversation_turn_cancelled" });
@@ -450,16 +465,20 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
-    await db
-      .update(agentApiKeys)
-      .set({ lastUsedAt: new Date() })
-      .where(eq(agentApiKeys.id, key.id));
+    await authDbLookup(() =>
+      db
+        .update(agentApiKeys)
+        .set({ lastUsedAt: new Date() })
+        .where(eq(agentApiKeys.id, key.id)),
+    );
 
-    const agentRecord = await db
-      .select()
-      .from(agents)
-      .where(eq(agents.id, key.agentId))
-      .then((rows) => rows[0] ?? null);
+    const agentRecord = await authDbLookup(() =>
+      db
+        .select()
+        .from(agents)
+        .where(eq(agents.id, key.agentId))
+        .then((rows) => rows[0] ?? null),
+    );
 
     if (!agentRecord || agentRecord.companyId !== key.companyId) {
       next(unauthorized("Agent record is missing or belongs to another company; obtain fresh credentials and retry"));
@@ -598,6 +617,77 @@ export async function retryOnTransientDbConnectionError<T>(run: () => Promise<T>
       if (attempt >= 2 || !isTransientDbConnectionError(error)) throw error;
       await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
     }
+  }
+}
+
+const DEFAULT_AUTH_DB_TIMEOUT_MS = 5_000;
+
+/**
+ * How long a single Bearer/agent-key auth DB lookup (including its own
+ * transient-connection retries) is allowed to run before `authDbLookup`
+ * gives up on it. Configurable so an operator can tighten or loosen the
+ * bound per deployment without a code change; falls back to a safe default
+ * when unset or not a positive number.
+ */
+function authDbTimeoutMs(): number {
+  const raw = process.env.PAPERCLIP_AUTH_DB_TIMEOUT_MS;
+  const parsed = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_AUTH_DB_TIMEOUT_MS;
+}
+
+/**
+ * Thrown by `authDbLookup` when its timeout wins the race. Carries a stable
+ * `code` so `errorHandler` (and tests) can distinguish it from an ordinary
+ * database error without parsing the message. The message itself names no
+ * connection details, host, or query text — it is safe to return to an
+ * unauthenticated caller as-is.
+ */
+export class AuthDbTimeoutError extends Error {
+  readonly code = "AUTH_DB_TIMEOUT";
+
+  constructor(timeoutMs: number) {
+    super(`Auth database lookup did not complete within ${timeoutMs}ms`);
+    this.name = "AuthDbTimeoutError";
+  }
+}
+
+/**
+ * Bounds one Bearer/agent-key auth DB lookup end to end: up to two
+ * transient-connection replays (see `retryOnTransientDbConnectionError`),
+ * then a hard wall-clock ceiling (`PAPERCLIP_AUTH_DB_TIMEOUT_MS`, default
+ * 5s). This is the fix for HOM-441 at the auth layer: a CloudNativePG
+ * primary switchover can leave a pooled socket half-open with no FIN or
+ * RST, so an in-flight query on it waits forever for a reply that will
+ * never come — no error, no close, nothing for the pool-level backstop
+ * (`socketWithInactivityTimeout` in packages/db) to react to *before* this
+ * ceiling fires (its own window is shorter, but this is the caller-facing
+ * bound that actually matters: reconnects that themselves land on another
+ * still-recovering socket can otherwise retry indefinitely with no bound
+ * of their own — see postgres.js's `initial`-query reconnect handling).
+ * The losing attempt is simply abandoned here; it does not keep the
+ * request open, and the driver's own connection/pool handling still tears
+ * the dead socket down independently, so nothing here can leak it forever.
+ * Every Bearer/agent-key auth DB call in this file goes through this
+ * wrapper so a request fails fast and the next request (once the failover
+ * completes) succeeds on a fresh connection — no process restart required.
+ *
+ * `timeoutMsOverride`, when given, replaces `PAPERCLIP_AUTH_DB_TIMEOUT_MS`
+ * for this one call — the auth readiness probe (`routes/health.ts`) uses it
+ * to hold to its own, tighter published bound instead of inheriting
+ * whatever the auth path's general-purpose timeout happens to be.
+ */
+export async function authDbLookup<T>(run: () => Promise<T>, timeoutMsOverride?: number): Promise<T> {
+  const timeoutMs = timeoutMsOverride ?? authDbTimeoutMs();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      retryOnTransientDbConnectionError(run),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new AuthDbTimeoutError(timeoutMs)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 

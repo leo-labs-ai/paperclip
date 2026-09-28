@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import net from "node:net";
 import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
 import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
@@ -159,6 +160,51 @@ export const DEFAULT_DB_MAX_LIFETIME_SEC = 30 * 60;
 export const DEFAULT_DB_STATEMENT_TIMEOUT_MS = 5 * 60 * 1000;
 export const DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS = 2 * 60 * 1000;
 
+/**
+ * Fork defaults for HA-failover connection recovery (HOM-441).
+ *
+ * postgres.js's `keep_alive` enables TCP keepalive on every pooled socket
+ * (driver default: 60s before the first probe). PostgreSQL's own
+ * `statement_timeout` above never fires for a connection that goes silently
+ * dead — a CloudNativePG primary switchover can leave the old primary's TCP
+ * session open on the client side with neither a FIN nor an RST, so the
+ * backend never receives the query it is supposedly running. Shortening
+ * `keep_alive` gets the first OS-level probe out sooner; how fast the kernel
+ * gives up after that depends on `TCP_KEEPINTVL`/`TCP_KEEPCNT`, which Node
+ * does not expose per-socket — tuning those is the paired lue-kube (pod
+ * `sysctls`) change, not this one.
+ *
+ * `socket_timeout` (implemented below via a custom postgres.js `socket`
+ * factory; there is no native driver option for it) is the backstop that
+ * does not depend on OS keepalive tuning at all: `net.Socket#setTimeout`
+ * fires once neither a read nor a write has happened for that long,
+ * destroying the socket and forcing postgres.js's existing reconnect path
+ * (hardened against the null-socket-write race by
+ * `patches/postgres@3.4.9.patch`, HOM-421) to replace it on the next query.
+ * It must stay comfortably above `statement_timeout` — otherwise it would
+ * abort a query PostgreSQL itself would still have let finish — so the
+ * default derives from whatever `statement_timeout` resolves to instead of
+ * being a fixed number; `DEFAULT_DB_SOCKET_TIMEOUT_MS` only applies when
+ * `statement_timeout` is disabled (`0`).
+ * `PAPERCLIP_DB_KEEPALIVE_SEC` / `PAPERCLIP_DB_SOCKET_TIMEOUT_MS` override;
+ * `0` disables either.
+ */
+export const DEFAULT_DB_KEEPALIVE_SEC = 15;
+export const DB_SOCKET_TIMEOUT_MARGIN_MS = 30 * 1000;
+export const DEFAULT_DB_SOCKET_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Fork default for `connect_timeout`. The driver default (30s) is tuned for
+ * an occasionally-slow network, not for a repeatedly-unreachable failed-over
+ * primary; a shorter budget means a doomed connection attempt fails, and the
+ * next attempt (which may hit a now-healthy replica-turned-primary) starts,
+ * sooner. `PAPERCLIP_DB_CONNECT_TIMEOUT_SEC` overrides; `0` restores the
+ * driver default (no timeout is not expressible here — see postgres.js
+ * `timer()`). The upstream `DATABASE_CONNECT_TIMEOUT_SECONDS` knob still
+ * wins when set, matching the idle-timeout precedence above.
+ */
+export const DEFAULT_DB_CONNECT_TIMEOUT_SEC = 10;
+
 function parseNonNegativeIntEnv(value: string | undefined, fallback: number): number {
   if (value === undefined) return fallback;
   const trimmed = value.trim();
@@ -189,6 +235,14 @@ export interface DatabaseClientOptions {
   statementTimeoutMs?: number;
   /** Server-side `idle_in_transaction_session_timeout` in ms for pool sessions; 0 disables. */
   idleInTransactionTimeoutMs?: number;
+  /** postgres.js `keep_alive` — TCP keepalive idle delay in seconds; 0 disables. */
+  keepAliveSeconds?: number;
+  /**
+   * Destroys a pooled socket after this many ms without any read or write
+   * activity (a client-side inactivity watchdog, not a PostgreSQL server-side
+   * setting). 0 disables. See the HOM-441 comment above `DEFAULT_DB_KEEPALIVE_SEC`.
+   */
+  socketTimeoutMs?: number;
   /**
    * postgres.js `connection.application_name`, shown in
    * `pg_stat_activity.application_name`. Lets an operator tell Paperclip's
@@ -279,6 +333,22 @@ export function databaseClientOptionsFromEnv(env: NodeJS.ProcessEnv = process.en
   if (maxLifetimeSeconds !== undefined) options.maxLifetimeSeconds = maxLifetimeSeconds;
   const applicationName = envNonEmptyString(env, "DATABASE_APPLICATION_NAME");
   if (applicationName !== undefined) options.applicationName = applicationName;
+  // Fork default: fail a doomed connection attempt sooner than the driver's
+  // own 30s default (see DEFAULT_DB_CONNECT_TIMEOUT_SEC above).
+  if (options.connectTimeoutSeconds === undefined) {
+    options.connectTimeoutSeconds = parseNonNegativeIntEnv(
+      env.PAPERCLIP_DB_CONNECT_TIMEOUT_SEC,
+      DEFAULT_DB_CONNECT_TIMEOUT_SEC,
+    );
+  }
+  // Fork default: shorten TCP keepalive so the OS notices a dead peer sooner
+  // than the driver's own 60s default (see the HOM-441 comment above).
+  options.keepAliveSeconds = parseNonNegativeIntEnv(env.PAPERCLIP_DB_KEEPALIVE_SEC, DEFAULT_DB_KEEPALIVE_SEC);
+  // Must stay above statement_timeout (see the HOM-441 comment above) or this
+  // would abort a query PostgreSQL itself would still have let finish.
+  const derivedSocketTimeoutMs =
+    options.statementTimeoutMs > 0 ? options.statementTimeoutMs + DB_SOCKET_TIMEOUT_MARGIN_MS : DEFAULT_DB_SOCKET_TIMEOUT_MS;
+  options.socketTimeoutMs = parseNonNegativeIntEnv(env.PAPERCLIP_DB_SOCKET_TIMEOUT_MS, derivedSocketTimeoutMs);
   return options;
 }
 
@@ -297,6 +367,59 @@ export function resolveDatabaseClientOptions(options: DatabaseClientOptions): Da
   };
 }
 
+/**
+ * A connection target as postgres.js hands it to a custom `socket` factory:
+ * `host`/`port` are arrays (multi-host connection strings), and the driver
+ * always dials `[0]` itself before falling back to the next entry on a
+ * fresh `connect()` call, so a factory only ever needs the first pair (see
+ * the "Custom socket" example in postgres.js's README).
+ */
+interface SocketFactoryTarget {
+  host: string[];
+  port: number[];
+}
+
+/**
+ * Builds a postgres.js `socket` factory (see `createSocket` in
+ * postgres@3.4.9's `src/connection.js`) that dials the connection itself —
+ * required by the custom-socket contract, which skips the driver's own
+ * `socket.connect(port, host)` call entirely and assumes the factory
+ * returns an already-connecting-or-connected socket — and destroys the
+ * resulting raw TCP socket after `timeoutMs` of read/write silence.
+ * `net.Socket#setTimeout` is a Node-level idle timer: it does not know or
+ * care whether a query is in flight, only whether any bytes have moved.
+ * Destroying the socket raises the same `error`/`close` sequence as any
+ * other network-dropped connection, which postgres.js already turns into a
+ * rejected, retryable `CONNECTION_CLOSED`-coded error and a reconnect on the
+ * next query (see the HOM-441 comment above `DEFAULT_DB_KEEPALIVE_SEC`).
+ */
+export function socketWithInactivityTimeout(timeoutMs: number): (target: SocketFactoryTarget) => Promise<net.Socket> {
+  return (target) =>
+    new Promise((resolve, reject) => {
+      const socket = net.connect({ host: target.host[0], port: target.port[0] }, () => {
+        socket.removeListener("error", onConnectError);
+        resolve(socket);
+      });
+      const onConnectError = (err: Error) => reject(err);
+      socket.once("error", onConnectError);
+
+      socket.setTimeout(timeoutMs);
+      socket.on("timeout", () => {
+        // Destroy with no error argument. postgres.js's own `closed(hadError)`
+        // handler only rejects the pending query itself when `hadError` is
+        // false (`!hadError && (query || sent.length) && error(...)`), and it
+        // nulls its socket reference in that same synchronous step. Passing an
+        // Error to destroy() instead makes Node also emit a separate `error`
+        // event first, which rejects the query slightly *before* `closed()`
+        // runs — a query dispatched into that narrow window can still reach
+        // `socket.write()` on the already-destroyed-but-not-yet-nulled socket
+        // and fail with `ERR_SOCKET_CLOSED`, a race distinct from the
+        // null-socket write that HOM-421 already guards against.
+        socket.destroy();
+      });
+    });
+}
+
 export function postgresJsOptions(options: DatabaseClientOptions): Record<string, unknown> {
   const driverOptions: Record<string, unknown> = {};
   if (options.prepare !== undefined) driverOptions.prepare = options.prepare;
@@ -305,6 +428,10 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
   if (options.connectTimeoutSeconds !== undefined) driverOptions.connect_timeout = options.connectTimeoutSeconds;
   if (options.maxLifetimeSeconds !== undefined && options.maxLifetimeSeconds > 0) {
     driverOptions.max_lifetime = options.maxLifetimeSeconds;
+  }
+  if (options.keepAliveSeconds !== undefined) driverOptions.keep_alive = options.keepAliveSeconds;
+  if (options.socketTimeoutMs !== undefined && options.socketTimeoutMs > 0) {
+    driverOptions.socket = socketWithInactivityTimeout(options.socketTimeoutMs);
   }
   const connection: Record<string, unknown> = {};
   if (options.statementTimeoutMs !== undefined && options.statementTimeoutMs > 0) {
