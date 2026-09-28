@@ -167,3 +167,23 @@ describe("resolveDatabaseClientOptions", () => {
     });
   });
 });
+
+describe("postgresJsOptions HA-failover wiring (HOM-441)", () => {
+  it("omits connect_timeout entirely when the knob is 0, restoring the driver default", () => {
+    // Passing `connect_timeout: 0` through would disable the driver's connect
+    // timer outright (postgres.js's `timer()` treats a falsy value as "no
+    // timer"), the opposite of what `0` is documented to mean.
+    const options = databaseClientOptionsFromEnv({ PAPERCLIP_DB_CONNECT_TIMEOUT_SEC: "0" });
+    expect(options.connectTimeoutSeconds).toBe(0);
+    expect(postgresJsOptions(options)).not.toHaveProperty("connect_timeout");
+  });
+
+  it("keeps the driver's own dial for a multi-host connection string", () => {
+    // The custom-socket branch of postgres.js's `connect()` skips its
+    // per-connection host rotation (`hostIndex`), which a shared factory
+    // cannot reproduce, so a multi-host URL keeps the driver's dial.
+    const options = databaseClientOptionsFromEnv({});
+    expect(postgresJsOptions(options, "postgres://u:p@h1,h2:5432/db")).not.toHaveProperty("socket");
+    expect(postgresJsOptions(options, "postgres://u:p@h1:5432/db")).toHaveProperty("socket", expect.any(Function));
+  });
+});

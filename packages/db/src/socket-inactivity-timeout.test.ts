@@ -72,6 +72,41 @@ describe("socketWithInactivityTimeout", () => {
     expect(socket.destroyed).toBe(false);
     socket.destroy();
   });
+
+  it("still destroys the socket when only outbound writes keep happening", async () => {
+    // postgres.js pipelines: after a failover every further query is written
+    // onto the already-dead socket. A read-or-write idle window (what
+    // `net.Socket#setTimeout` measures) would be pushed out by each of those
+    // writes, so the backstop would never reclaim the connection. The window
+    // must therefore track reads only.
+    const port = await startEchoServer(); // accepts, never answers
+    const socket = await socketWithInactivityTimeout(120)({ host: ["127.0.0.1"], port: [port] });
+    socket.on("error", () => {});
+
+    const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+    const writer = setInterval(() => {
+      if (!socket.destroyed) socket.write("ping");
+    }, 20);
+    try {
+      await closed;
+    } finally {
+      clearInterval(writer);
+    }
+    expect(socket.destroyed).toBe(true);
+  });
+
+  it("rejects instead of hanging when the dial never completes", async () => {
+    // TEST-NET-1 (RFC 5737) is reserved and unrouted: the SYN either
+    // blackholes or is refused by the local stack. Either way the factory's
+    // promise has to settle — postgres.js awaits it inside `connect()` and
+    // attaches its own listeners only afterwards, so a pending promise wedges
+    // that pool slot forever.
+    const startedAt = Date.now();
+    await expect(
+      socketWithInactivityTimeout(60_000, 150)({ host: ["192.0.2.1"], port: [5432] }),
+    ).rejects.toBeInstanceOf(Error);
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  }, 10_000);
 });
 
 describe("a postgres.js client reconnects through a socket left dead by a silent failover", () => {

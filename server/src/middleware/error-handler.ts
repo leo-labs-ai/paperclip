@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from "express";
 import type { Db } from "@paperclipai/db";
 import { ZodError } from "zod";
-import { HttpError } from "../errors.js";
+import { HttpError, serviceUnavailable } from "../errors.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { captureException } from "../sentry.js";
@@ -128,6 +128,18 @@ export function errorHandler(
   res: Response,
   _next: NextFunction,
 ) {
+  // An auth DB lookup that hit its ceiling (`AuthDbTimeoutError` in
+  // middleware/auth.ts) means the database is transiently unreachable, not
+  // that the server is broken: answer 503 with the stable code so clients and
+  // the k8s stack can tell the two apart and retry. Matched on the code rather
+  // than the class to keep this module free of an import cycle through auth.
+  if (
+    err instanceof Error &&
+    (err as { code?: unknown }).code === "AUTH_DB_TIMEOUT"
+  ) {
+    err = serviceUnavailable(err.message, { code: "AUTH_DB_TIMEOUT" });
+  }
+
   if (err instanceof HttpError) {
     const details =
       err.details &&

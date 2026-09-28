@@ -204,6 +204,8 @@ export const DEFAULT_DB_SOCKET_TIMEOUT_MS = 10 * 60 * 1000;
  * wins when set, matching the idle-timeout precedence above.
  */
 export const DEFAULT_DB_CONNECT_TIMEOUT_SEC = 10;
+/** postgres.js's own `connect_timeout` default, applied when ours is unset or `0`. */
+export const DRIVER_CONNECT_TIMEOUT_SEC = 30;
 
 function parseNonNegativeIntEnv(value: string | undefined, fallback: number): number {
   if (value === undefined) return fallback;
@@ -369,10 +371,11 @@ export function resolveDatabaseClientOptions(options: DatabaseClientOptions): Da
 
 /**
  * A connection target as postgres.js hands it to a custom `socket` factory:
- * `host`/`port` are arrays (multi-host connection strings), and the driver
- * always dials `[0]` itself before falling back to the next entry on a
- * fresh `connect()` call, so a factory only ever needs the first pair (see
- * the "Custom socket" example in postgres.js's README).
+ * `host`/`port` are arrays (multi-host connection strings). The driver's own
+ * per-connection host rotation (`hostIndex` in `connect()`) is skipped
+ * entirely on the `options.socket` branch, so a factory cannot reproduce it;
+ * the factory is therefore only installed for a single-host connection
+ * string (see `postgresJsOptions`) and only ever dials `[0]`.
  */
 interface SocketFactoryTarget {
   host: string[];
@@ -385,26 +388,80 @@ interface SocketFactoryTarget {
  * required by the custom-socket contract, which skips the driver's own
  * `socket.connect(port, host)` call entirely and assumes the factory
  * returns an already-connecting-or-connected socket — and destroys the
- * resulting raw TCP socket after `timeoutMs` of read/write silence.
- * `net.Socket#setTimeout` is a Node-level idle timer: it does not know or
- * care whether a query is in flight, only whether any bytes have moved.
- * Destroying the socket raises the same `error`/`close` sequence as any
- * other network-dropped connection, which postgres.js already turns into a
+ * resulting raw TCP socket after `timeoutMs` without a single byte *read*
+ * from the peer. Read silence, not the read-or-write silence
+ * `net.Socket#setTimeout` measures: postgres.js pipelines, so every
+ * subsequent query written onto an already-dead socket would keep pushing a
+ * read-or-write window out and the backstop would never reclaim the socket.
+ * Destroying it raises the same `error`/`close` sequence as any other
+ * network-dropped connection, which postgres.js already turns into a
  * rejected, retryable `CONNECTION_CLOSED`-coded error and a reconnect on the
  * next query (see the HOM-441 comment above `DEFAULT_DB_KEEPALIVE_SEC`).
+ *
+ * `connectTimeoutMs` bounds the TCP dial itself. The driver's own
+ * `connect_timeout` cannot: `connectTimer.start()` runs only *after*
+ * `await options.socket(options)` resolves, so with a custom factory
+ * installed the dial would otherwise be bounded only by the OS SYN retry
+ * budget (~127s on Linux) — the opposite of a fast reconnect onto a
+ * failed-over primary. `0` leaves the dial to the OS.
  */
-export function socketWithInactivityTimeout(timeoutMs: number): (target: SocketFactoryTarget) => Promise<net.Socket> {
+export function socketWithInactivityTimeout(
+  timeoutMs: number,
+  connectTimeoutMs = 0,
+): (target: SocketFactoryTarget) => Promise<net.Socket> {
   return (target) =>
     new Promise((resolve, reject) => {
-      const socket = net.connect({ host: target.host[0], port: target.port[0] }, () => {
-        socket.removeListener("error", onConnectError);
-        resolve(socket);
-      });
-      const onConnectError = (err: Error) => reject(err);
-      socket.once("error", onConnectError);
+      let settled = false;
+      const socket = net.connect({ host: target.host[0], port: target.port[0] }, () => settle(null));
 
-      socket.setTimeout(timeoutMs);
-      socket.on("timeout", () => {
+      // Every path out of the dial has to settle this promise. postgres.js
+      // awaits it inside `connect()` and only attaches its own `close`/
+      // `error` listeners afterwards, so a promise left pending wedges that
+      // pool slot permanently — repeated occurrences exhaust `max` and force
+      // the pod restart this change exists to eliminate.
+      function settle(err: Error | null): void {
+        if (settled) return;
+        settled = true;
+        if (connectTimer) clearTimeout(connectTimer);
+        socket.removeListener("error", onPreConnectError);
+        socket.removeListener("close", onPreConnectClose);
+        if (err) {
+          clearTimeout(readIdleTimer);
+          socket.destroy();
+          reject(err);
+          return;
+        }
+        resolve(socket);
+      }
+
+      const connectionClosed = (message: string) =>
+        Object.assign(new Error(message), { code: "CONNECTION_CLOSED" });
+      const onPreConnectError = (err: Error) => settle(err);
+      const onPreConnectClose = () => settle(connectionClosed("Database socket closed before it finished connecting"));
+      socket.once("error", onPreConnectError);
+      socket.once("close", onPreConnectClose);
+
+      const connectTimer =
+        connectTimeoutMs > 0
+          ? setTimeout(() => {
+              settle(Object.assign(new Error(`Database socket did not connect within ${connectTimeoutMs}ms`), {
+                code: "CONNECT_TIMEOUT",
+              }));
+            }, connectTimeoutMs).unref()
+          : null;
+
+      // Armed from the dial onwards and refreshed only by inbound data, so a
+      // stream of outbound writes on a socket whose peer has gone silent
+      // cannot postpone it.
+      const readIdleTimer = setTimeout(onReadIdle, timeoutMs).unref();
+      socket.on("data", () => readIdleTimer.refresh());
+      socket.once("close", () => clearTimeout(readIdleTimer));
+
+      function onReadIdle(): void {
+        if (!settled) {
+          settle(connectionClosed(`Database socket read nothing within ${timeoutMs}ms`));
+          return;
+        }
         // Destroy with no error argument. postgres.js's own `closed(hadError)`
         // handler only rejects the pending query itself when `hadError` is
         // false (`!hadError && (query || sent.length) && error(...)`), and it
@@ -416,22 +473,52 @@ export function socketWithInactivityTimeout(timeoutMs: number): (target: SocketF
         // and fail with `ERR_SOCKET_CLOSED`, a race distinct from the
         // null-socket write that HOM-421 already guards against.
         socket.destroy();
-      });
+      }
     });
 }
 
-export function postgresJsOptions(options: DatabaseClientOptions): Record<string, unknown> {
+/**
+ * Counts the hosts in a connection URL the way postgres.js's own `parseUrl`
+ * does: the authority between `://` (or the credentials' `@`) and the first
+ * `/` or `?`, comma-separated. A URL the driver tolerates but `new URL()`
+ * rejects (an empty string falls back to the `PG*` variables) counts as one.
+ */
+export function connectionUrlHostCount(url: string): number {
+  const schemeless = url.slice(url.indexOf("://") + 3).split(/[?/]/)[0] ?? "";
+  const authority = schemeless.slice(schemeless.indexOf("@") + 1);
+  if (authority.length === 0) return 1;
+  return authority.split(",").length;
+}
+
+/**
+ * `url` decides whether the inactivity-timeout socket factory is installed:
+ * a multi-host connection string keeps the driver's own dial (and with it
+ * its per-connection host rotation, which the custom-socket branch of
+ * `connect()` skips), so it keeps the OS-keepalive layer as its only
+ * failover backstop. Omitted means single-host.
+ */
+export function postgresJsOptions(options: DatabaseClientOptions, url?: string): Record<string, unknown> {
   const driverOptions: Record<string, unknown> = {};
   if (options.prepare !== undefined) driverOptions.prepare = options.prepare;
   if (options.maxConnections !== undefined) driverOptions.max = options.maxConnections;
   if (options.idleTimeoutSeconds !== undefined) driverOptions.idle_timeout = options.idleTimeoutSeconds;
-  if (options.connectTimeoutSeconds !== undefined) driverOptions.connect_timeout = options.connectTimeoutSeconds;
+  // `connect_timeout: 0` would disable the driver's connect timer outright
+  // (`timer()` treats a falsy value as "no timer"), so `0` means "restore the
+  // driver's own 30s default" by leaving the option unset.
+  if (options.connectTimeoutSeconds !== undefined && options.connectTimeoutSeconds > 0) {
+    driverOptions.connect_timeout = options.connectTimeoutSeconds;
+  }
   if (options.maxLifetimeSeconds !== undefined && options.maxLifetimeSeconds > 0) {
     driverOptions.max_lifetime = options.maxLifetimeSeconds;
   }
   if (options.keepAliveSeconds !== undefined) driverOptions.keep_alive = options.keepAliveSeconds;
-  if (options.socketTimeoutMs !== undefined && options.socketTimeoutMs > 0) {
-    driverOptions.socket = socketWithInactivityTimeout(options.socketTimeoutMs);
+  const singleHost = url === undefined || connectionUrlHostCount(url) === 1;
+  if (options.socketTimeoutMs !== undefined && options.socketTimeoutMs > 0 && singleHost) {
+    const connectTimeoutMs =
+      options.connectTimeoutSeconds !== undefined && options.connectTimeoutSeconds > 0
+        ? options.connectTimeoutSeconds * 1000
+        : DRIVER_CONNECT_TIMEOUT_SEC * 1000;
+    driverOptions.socket = socketWithInactivityTimeout(options.socketTimeoutMs, connectTimeoutMs);
   }
   const connection: Record<string, unknown> = {};
   if (options.statementTimeoutMs !== undefined && options.statementTimeoutMs > 0) {
@@ -447,7 +534,7 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
 
 export function createDb(url: string, options?: DatabaseClientOptions) {
   const resolved = resolveDatabaseClientOptions(options ?? databaseClientOptionsFromEnv());
-  const sql = postgres(url, postgresJsOptions(resolved));
+  const sql = postgres(url, postgresJsOptions(resolved, url));
   const key = hostPortKeyOrNull(url);
   if (key) registerClient(key, sql);
   // The registry keeps the real client (teardown must end the actual pool);

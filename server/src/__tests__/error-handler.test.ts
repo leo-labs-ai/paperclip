@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
+import { AuthDbTimeoutError } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 
 const recordResponsibleUserDenialOnActiveRunMock = vi.hoisted(() => vi.fn());
@@ -291,5 +292,27 @@ describe("errorHandler", () => {
         code: "RESPONSIBLE_USER_UNAUTHORIZED",
       },
     );
+  });
+});
+
+describe("errorHandler on a timed-out auth database lookup (HOM-441)", () => {
+  beforeEach(() => {
+    captureExceptionMock.mockReset();
+    telemetryMocks.trackErrorHandlerCrash.mockReset();
+  });
+
+  it("answers 503 with the stable code instead of a generic 500", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+
+    errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith({
+      error: "Auth database lookup did not complete within 5000ms",
+      code: "AUTH_DB_TIMEOUT",
+      details: { code: "AUTH_DB_TIMEOUT" },
+    });
   });
 });
