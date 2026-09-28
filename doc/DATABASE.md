@@ -243,9 +243,11 @@ connection pulls the pod out of rotation instead of continuing to accept traffic
 serve.
 
 The browser-session branch of `actorMiddleware` is bounded the same way: it draws from the
-same pool, so `resolveCloudTenantActor` and the session's instance-role/membership lookups
-go through the same ceiling and answer `503 AUTH_DB_TIMEOUT` instead of hanging the board
-UI. `resolveCloudTenantActor` and the two `activity_log` audit inserts take
+same pool, so `resolveCloudTenantActor`, better-auth's own session resolution, and the
+session's instance-role/membership lookups all go through the same ceiling and answer
+`503 AUTH_DB_TIMEOUT` instead of hanging the board UI. A timeout while resolving the session
+is rethrown rather than swallowed into an anonymous actor: a switchover must read as a
+retryable 503, not as an expired cookie that logs every board user out. `resolveCloudTenantActor` and the two `activity_log` audit inserts take
 `withAuthDbTimeout` rather than `authDbLookup`: the first already owns its transient-connection
 replay, and replaying a committed audit INSERT whose reply was lost to the switchover would
 write a second, false row.

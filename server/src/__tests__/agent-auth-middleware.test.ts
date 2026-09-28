@@ -544,6 +544,34 @@ describe("browser-session auth path bounds its database lookups (HOM-441)", () =
     else process.env.PAPERCLIP_AUTH_DB_TIMEOUT_MS = originalTimeout;
   });
 
+  it("answers 503 AUTH_DB_TIMEOUT when resolving the session itself never returns", async () => {
+    // better-auth resolves a cookie session with its own query on the same
+    // pool, so it hangs on a wedged connection exactly like the role lookup
+    // that follows it. Surfacing it as a retryable 503 also keeps a failover
+    // from being mistaken for an expired cookie and logging the board out.
+    process.env.PAPERCLIP_AUTH_DB_TIMEOUT_MS = "120";
+    const db = {} as any;
+
+    const app = express();
+    app.use(
+      actorMiddleware(db, {
+        deploymentMode: "authenticated",
+        resolveSession: () => new Promise(() => {}),
+      }),
+    );
+    app.get("/actor", (req, res) => {
+      res.json(req.actor);
+    });
+    app.use(errorHandler);
+
+    const startedAt = Date.now();
+    const res = await request(app).get("/actor");
+
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe("AUTH_DB_TIMEOUT");
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  }, 10_000);
+
   it("answers 503 AUTH_DB_TIMEOUT instead of hanging when the session role lookup never returns", async () => {
     // The cookie-session branch draws from the same pool as every Bearer
     // lookup, so a connection wedged by a switchover hangs the board UI the

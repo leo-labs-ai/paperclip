@@ -282,6 +282,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     if (!hasBearerCredentials) {
       if (opts.deploymentMode === "authenticated" && opts.resolveSession) {
+        const resolveSession = opts.resolveSession;
         // Bounded like every Bearer/agent-key lookup: the browser-session
         // branch draws from the same pool, so an unbounded await here is the
         // same HOM-441 hang for the board UI. `resolveCloudTenantActor` owns
@@ -299,8 +300,12 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
         let session: BetterAuthSessionResult | null = null;
         try {
-          session = await opts.resolveSession(req);
+          session = await withAuthDbTimeout(() => resolveSession(req));
         } catch (err) {
+          // A failover must not be laundered into a 401: swallowing it here
+          // would log every board user out mid-session instead of returning
+          // the retryable 503 the Bearer paths already return.
+          if (err instanceof AuthDbTimeoutError) throw err;
           logger.warn(
             { err, method: req.method, url: req.originalUrl },
             "Failed to resolve auth session from request headers",
