@@ -261,7 +261,8 @@ rate-limited (once per 30s) `logger.warn` instead of calling `reportCrash` -- Se
 never see a burst of hundreds of identical, non-actionable crash events for what is an
 expected, transient condition during a switchover. That warn line carries
 `suppressedSinceLastLog`, the number of occurrences the window stood in for, so the scale of
-a failover is still legible. The same condition also skips `attachErrorContext`, and marks
+a failover is still legible; a trailing timer flushes that count once the window closes, so a
+burst that stops before the next window still reports its tail. The same condition also skips `attachErrorContext`, and marks
 the response so the access log records it at warn rather than error level: otherwise the
 flood would simply move from Sentry into the log sink, one error-level line per affected
 request. Every other 500-class error keeps the unchanged error context and crash report.

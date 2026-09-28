@@ -390,6 +390,42 @@ describe("errorHandler on a timed-out auth database lookup (HOM-441)", () => {
     }
   });
 
+  it("flushes the suppressed count when the burst stops instead of losing it", async () => {
+    // A switchover produces its whole burst in a few seconds and then stops,
+    // so the request that would have carried the count out on the next window
+    // never arrives.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2032-01-01T00:00:00.000Z"));
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => {}) as any);
+    try {
+      const req = makeReq();
+      const res = makeRes() as any;
+      const next = vi.fn() as unknown as NextFunction;
+
+      errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
+      for (let i = 0; i < 3; i++) {
+        await vi.advanceTimersByTimeAsync(1_000);
+        errorHandler(new AuthDbTimeoutError(5_000), req, res, next);
+      }
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      expect(warnSpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({ suppressedSinceLastLog: 3 }),
+        expect.any(String),
+      );
+
+      // Nothing further is emitted once the count has been flushed.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("attaches no error context, and marks the response so the access log stays at warn level", () => {
     const warnSpy = vi.spyOn(logger, "warn").mockImplementation((() => {}) as any);
     try {

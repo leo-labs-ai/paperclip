@@ -94,6 +94,7 @@ function reportCrash(error: Error): void {
 const AUTH_DB_TIMEOUT_WARN_INTERVAL_MS = 30_000;
 let lastAuthDbTimeoutWarnAt = 0;
 let suppressedAuthDbTimeouts = 0;
+let authDbTimeoutFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
  * `AUTH_DB_TIMEOUT` (see `AuthDbTimeoutError` in middleware/auth.ts) means a
@@ -109,19 +110,39 @@ let suppressedAuthDbTimeouts = 0;
  * a failover stays legible: one timed-out request and a thousand must not look
  * identical in the logs.
  */
-function logAuthDbTimeoutWarning(error: Error): void {
-  const now = Date.now();
-  if (now - lastAuthDbTimeoutWarnAt < AUTH_DB_TIMEOUT_WARN_INTERVAL_MS) {
-    suppressedAuthDbTimeouts += 1;
-    return;
-  }
+function emitAuthDbTimeoutWarning(error: Error): void {
   const suppressedSinceLastLog = suppressedAuthDbTimeouts;
   suppressedAuthDbTimeouts = 0;
-  lastAuthDbTimeoutWarnAt = now;
+  lastAuthDbTimeoutWarnAt = Date.now();
   logger.warn(
     { err: error, suppressedSinceLastLog },
     "auth database lookup timed out (503) -- reported as a warning, not a crash, because this is the expected shape of an in-progress failover",
   );
+}
+
+function logAuthDbTimeoutWarning(error: Error): void {
+  const now = Date.now();
+  const elapsedMs = now - lastAuthDbTimeoutWarnAt;
+  if (elapsedMs < AUTH_DB_TIMEOUT_WARN_INTERVAL_MS) {
+    suppressedAuthDbTimeouts += 1;
+    // A failover is over in seconds, so the requests that would have carried
+    // the count out on a later window usually never arrive. Without this the
+    // burst's tail is silently dropped and a thousand timeouts do look like
+    // one.
+    if (authDbTimeoutFlushTimer === null) {
+      authDbTimeoutFlushTimer = setTimeout(() => {
+        authDbTimeoutFlushTimer = null;
+        if (suppressedAuthDbTimeouts > 0) emitAuthDbTimeoutWarning(error);
+      }, Math.min(AUTH_DB_TIMEOUT_WARN_INTERVAL_MS, Math.max(0, AUTH_DB_TIMEOUT_WARN_INTERVAL_MS - elapsedMs)));
+      authDbTimeoutFlushTimer.unref?.();
+    }
+    return;
+  }
+  if (authDbTimeoutFlushTimer !== null) {
+    clearTimeout(authDbTimeoutFlushTimer);
+    authDbTimeoutFlushTimer = null;
+  }
+  emitAuthDbTimeoutWarning(error);
 }
 
 function getPaperclipDb(req: Request): Db | null {
