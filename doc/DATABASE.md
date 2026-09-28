@@ -277,6 +277,16 @@ time. The patch calls postgres.js's own `onclose` in that catch branch so the po
 the connection on its next query instead of leaking the slot; see the pre-connect dial
 failure test in `packages/db/src/socket-inactivity-timeout.test.ts`.
 
+**No per-request auth budget.** `PAPERCLIP_AUTH_DB_TIMEOUT_MS` bounds one lookup, so a
+request that makes several sequential lookups is bounded by their sum. The longest branch is
+an agent-JWT login: the board-API-key lookup, the agent-API-key lookup, the agent record,
+the run's identity row, `captureRunIdentity`, the legacy responsible-user lookup (only when
+the capture returns no context and the JWT carries no `responsible_user_id`), and the
+responsible user's memberships — up to seven in a row, so about **35 seconds** at the 5000ms
+default before the request fails. Every one of them still fails fast individually, and the
+common case is two or three, but a true per-request deadline (one budget consumed by all the
+lookups on the request) is a follow-up, not part of this change.
+
 **Known limitation:** a connection that goes silent *after* a query is already in flight on
 it (the core HOM-441 scenario) is not proactively destroyed the moment `authDbLookup` times
 out on that query -- the losing attempt is simply abandoned, and the connection stays parked
