@@ -227,4 +227,60 @@ describe("a postgres.js client reconnects through a socket left dead by a silent
     await expect(sql.unsafe("select 1", [])).resolves.toBeDefined();
     expect(started.connectionCount()).toBeGreaterThanOrEqual(2);
   }, 15_000);
+
+  it("reclaims the pool slot after a pre-connect dial failure instead of leaking it forever", async () => {
+    // Grab an ephemeral port and immediately stop listening on it: the next
+    // connect attempt against it gets ECONNREFUSED, which is the pre-connect
+    // failure path in postgres.js's custom-socket branch of `createSocket()`
+    // -- distinct from the mid-query silent-death path the rest of this
+    // file covers. `socketWithInactivityTimeout`'s factory promise rejects
+    // on that failure (see its `onPreConnectError` handler), and
+    // postgres.js's own `createSocket()` (src/connection.js) only calls
+    // `error(e)` on a rejected factory promise -- it never calls `onclose`,
+    // so the connection object is left parked in the pool's `connecting`
+    // queue forever with `error`/`close` listeners never attached to a real
+    // socket. With `max: 1` that is the pool's only slot: every later query
+    // queues behind it and hangs forever, reproducing the same class of
+    // stuck-pod symptom HOM-441 exists to eliminate, just one layer earlier
+    // (dial time instead of query time).
+    const probe = net.createServer();
+    const port = await new Promise<number>((resolve) => {
+      probe.listen(0, "127.0.0.1", () => resolve((probe.address() as net.AddressInfo).port));
+    });
+    await new Promise((resolve) => probe.close(resolve));
+
+    const url = `postgres://test:test@127.0.0.1:${port}/test`;
+    sql = postgres(url, {
+      connect_timeout: 5,
+      prepare: false,
+      max: 1,
+      idle_timeout: 0,
+      socket: socketWithInactivityTimeout(5_000, 200),
+    } as postgres.Options<Record<string, never>>);
+
+    await expect(sql.unsafe("select 1", [])).rejects.toBeInstanceOf(Error);
+
+    // Bring up a real (minimal) server on the same port now, and prove the
+    // *next* query succeeds quickly. If the pre-connect failure had leaked
+    // the pool's one slot, this second query would sit behind it in
+    // postgres.js's own pending-queries queue and never get a connection --
+    // no timeout of its own would ever fire for it.
+    server = net.createServer((socket) => {
+      let greeted = false;
+      socket.on("data", () => {
+        if (!greeted) {
+          greeted = true;
+          socket.write(Buffer.concat([authOk, readyForQuery]));
+          return;
+        }
+        socket.write(Buffer.concat([emptyQueryReply, readyForQuery]));
+      });
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((resolve) => server!.listen(port, "127.0.0.1", () => resolve()));
+
+    const startedAt = Date.now();
+    await expect(sql.unsafe("select 1", [])).resolves.toBeDefined();
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  }, 10_000);
 });
