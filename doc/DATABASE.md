@@ -227,7 +227,13 @@ driver options without passing the URL (the host count cannot be verified) likew
 the driver's dial rather than assuming a single host. Because postgres.js's own dial is the
 branch that sets `socket.host` — which `secure()` reads back as the TLS handshake's
 `servername` — the factory sets `host`/`port` on the socket it returns, so SNI still reaches
-an endpoint that routes on it (Neon, Supavisor, an SNI-based ingress). See `packages/db/src/socket-inactivity-timeout.test.ts` for a
+an endpoint that routes on it (Neon, Supavisor, an SNI-based ingress). The factory also
+honours a unix-domain-socket connection (`%2Fvar%2Frun%2Fpostgresql` in the URL authority,
+`PGHOST=/path`, or an explicit `path` option, all of which postgres.js resolves to
+`options.path`): the driver's own branch returns on `path` before `socket.connect(port,
+host)`, so without the same check the path would be TCP-dialled as a hostname and never
+resolve. `socket.host` stays unset there, matching the driver, so no SNI is sent for a
+filesystem path. See `packages/db/src/socket-inactivity-timeout.test.ts` for a
 simulated-failover regression test (a fake wire-protocol TCP server that completes the
 startup handshake and then goes silent, standing in for the dead switchover peer) and
 `server/src/__tests__/auth-db-lookup.test.ts` for the same scenario proven bounded at the

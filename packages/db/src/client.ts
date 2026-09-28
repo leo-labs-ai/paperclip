@@ -380,6 +380,15 @@ export function resolveDatabaseClientOptions(options: DatabaseClientOptions): Da
 interface SocketFactoryTarget {
   host: string[];
   port: number[];
+  /**
+   * Set by postgres.js when the connection resolves to a unix domain socket
+   * (`%2Fvar%2Frun%2Fpostgresql` in the URL authority, `PGHOST=/path`, or an
+   * explicit `path` option). Its own dial branch honours this before
+   * `socket.connect(port, host)`; a custom factory returns before that branch
+   * runs, so it has to honour it here or every connection would TCP-dial the
+   * path as a hostname and fail to resolve.
+   */
+  path?: string | false;
 }
 
 /**
@@ -412,16 +421,20 @@ export function socketWithInactivityTimeout(
   return (target) =>
     new Promise((resolve, reject) => {
       let settled = false;
-      const socket = net.connect({ host: target.host[0], port: target.port[0] }, () =>
-        settle(null),
+      const socket = net.connect(
+        target.path ? { path: target.path } : { host: target.host[0], port: target.port[0] },
+        () => settle(null),
       ) as net.Socket & { host?: string; port?: number };
       // postgres.js assigns these itself on its own dial branch and reads them
       // back in `secure()` as `servername: net.isIP(socket.host) ? undefined :
       // socket.host`. A custom factory returns before that branch runs, so
       // without this the TLS handshake carries no SNI — and an endpoint that
       // routes on SNI (Neon, Supavisor) rejects the connection outright.
-      socket.host = target.host[0];
-      socket.port = target.port[0];
+      // Left unset for a unix socket, exactly as the driver's own branch does.
+      if (!target.path) {
+        socket.host = target.host[0];
+        socket.port = target.port[0];
+      }
 
       // Every path out of the dial has to settle this promise. postgres.js
       // awaits it inside `connect()` and only attaches its own `close`/

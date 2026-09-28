@@ -471,3 +471,45 @@ describe("a postgres.js client reconnects through a socket left dead by a silent
     expect(Date.now() - startedAt).toBeLessThan(2_000);
   }, 10_000);
 });
+
+describe("socketWithInactivityTimeout on a unix domain socket (HOM-441)", () => {
+  it("dials the resolved socket path instead of TCP-dialling it as a hostname", async () => {
+    // postgres.js resolves `postgres://%2Fvar%2Frun%2Fpostgresql/db`,
+    // `PGHOST=/path` and an explicit `path` option all to `options.path`, and
+    // its own dial branch returns on it before `socket.connect(port, host)`.
+    // A custom factory replaces that branch wholesale, so it has to honour
+    // `path` too — dialling `{ host: "/var/run/postgresql", port: 5432 }`
+    // fails name resolution and no connection is ever established.
+    const dir = mkdtempSync(path.join(tmpdir(), "paperclip-db-unix-"));
+    const socketPath = path.join(dir, "s.PGSQL.5432");
+    const server = net.createServer((connection) => {
+      connection.write(Buffer.from("hello"));
+      connection.on("error", () => {});
+    });
+    try {
+      await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
+
+      const connected = await socketWithInactivityTimeout(60_000, 5_000)({
+        host: [socketPath],
+        port: [5432],
+        path: socketPath,
+      });
+
+      try {
+        const greeting = await new Promise<Buffer>((resolve, reject) => {
+          connected.once("data", resolve);
+          connected.once("error", reject);
+        });
+        expect(greeting.toString()).toBe("hello");
+        // The driver leaves `socket.host` unset for a unix socket so `secure()`
+        // sends no SNI for a path that is not a hostname.
+        expect((connected as net.Socket & { host?: string }).host).toBeUndefined();
+      } finally {
+        connected.destroy();
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+});
