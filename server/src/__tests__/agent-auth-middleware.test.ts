@@ -372,6 +372,47 @@ describe("agent auth middleware", () => {
     });
   });
 
+  it("writes the run-header-mismatch audit row once when the connection drops after it commits", async () => {
+    // HOM-441: the audit INSERT is bounded, but it must not be replayed. A
+    // switchover can drop the socket after PostgreSQL commits the row and
+    // before the reply reaches the driver, which surfaces as a transient
+    // CONNECTION_CLOSED — replaying that writes a second, false audit row.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const spoofedRunId = randomUUID();
+    const { db, activity } = createDbState({
+      agent: { id: agentId, companyId },
+      run: { id: runId, companyId, agentId, responsibleUserId: "user-claim" },
+    });
+    const passthroughInsert = db.insert;
+    let insertAttempts = 0;
+    db.insert = (table: unknown) => ({
+      values(values: Record<string, unknown>) {
+        if (table !== activityLog) return passthroughInsert(table).values(values);
+        insertAttempts += 1;
+        activity.push(values);
+        return insertAttempts === 1
+          ? Promise.reject(
+              new Error("Failed query: insert into activity_log …", {
+                cause: Object.assign(new Error("write CONNECTION_CLOSED"), { code: "CONNECTION_CLOSED" }),
+              }),
+            )
+          : Promise.resolve([]);
+      },
+    });
+    const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId, "user-claim");
+
+    const res = await request(createApp(db))
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", spoofedRunId);
+
+    expect(res.status).toBe(422);
+    expect(insertAttempts).toBe(1);
+    expect(activity).toHaveLength(1);
+  });
+
   it("falls back to the run row responsible user for legacy claim-less agent JWTs", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -493,4 +534,74 @@ describe("agent auth middleware", () => {
       details: { method: "GET", url: `/companies/${companyId}/protected` },
     });
   });
+});
+
+describe("browser-session auth path bounds its database lookups (HOM-441)", () => {
+  const originalTimeout = process.env.PAPERCLIP_AUTH_DB_TIMEOUT_MS;
+
+  afterEach(() => {
+    if (originalTimeout === undefined) delete process.env.PAPERCLIP_AUTH_DB_TIMEOUT_MS;
+    else process.env.PAPERCLIP_AUTH_DB_TIMEOUT_MS = originalTimeout;
+  });
+
+  it("answers 503 AUTH_DB_TIMEOUT when resolving the session itself never returns", async () => {
+    // better-auth resolves a cookie session with its own query on the same
+    // pool, so it hangs on a wedged connection exactly like the role lookup
+    // that follows it. Surfacing it as a retryable 503 also keeps a failover
+    // from being mistaken for an expired cookie and logging the board out.
+    process.env.PAPERCLIP_AUTH_DB_TIMEOUT_MS = "120";
+    const db = {} as any;
+
+    const app = express();
+    app.use(
+      actorMiddleware(db, {
+        deploymentMode: "authenticated",
+        resolveSession: () => new Promise(() => {}),
+      }),
+    );
+    app.get("/actor", (req, res) => {
+      res.json(req.actor);
+    });
+    app.use(errorHandler);
+
+    const startedAt = Date.now();
+    const res = await request(app).get("/actor");
+
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe("AUTH_DB_TIMEOUT");
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  }, 10_000);
+
+  it("answers 503 AUTH_DB_TIMEOUT instead of hanging when the session role lookup never returns", async () => {
+    // The cookie-session branch draws from the same pool as every Bearer
+    // lookup, so a connection wedged by a switchover hangs the board UI the
+    // same way it hung the agents before HOM-441.
+    process.env.PAPERCLIP_AUTH_DB_TIMEOUT_MS = "120";
+    const db = {
+      select: () => ({ from: () => ({ where: () => new Promise(() => {}) }) }),
+    } as any;
+    const userId = randomUUID();
+
+    const app = express();
+    app.use(
+      actorMiddleware(db, {
+        deploymentMode: "authenticated",
+        resolveSession: async () => ({
+          user: { id: userId, name: "Board User", email: "board@example.com" },
+          session: { id: randomUUID(), userId },
+        }),
+      }),
+    );
+    app.get("/actor", (req, res) => {
+      res.json(req.actor);
+    });
+    app.use(errorHandler);
+
+    const startedAt = Date.now();
+    const res = await request(app).get("/actor");
+
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe("AUTH_DB_TIMEOUT");
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  }, 10_000);
 });

@@ -197,6 +197,124 @@ determinism, so a pool opened at startup expires together. If you see herd recon
 lengthen `PAPERCLIP_DB_MAX_LIFETIME_SEC` or set it to `0` to fall back to postgres.js's
 jittered default.
 
+### HA-failover connection recovery (HOM-441)
+
+A CloudNativePG primary switchover can leave a pooled connection's TCP session open on the
+client side with neither a FIN nor an RST. The backend never received the in-flight query,
+so PostgreSQL's own `statement_timeout` never fires for it — the client just waits forever
+for a reply that will never come. Three layers close that gap, from the OS socket up to the
+auth request itself:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `PAPERCLIP_DB_KEEPALIVE_SEC` | `15` | postgres.js `keep_alive`: TCP keepalive idle delay before the OS sends the first probe on a pooled socket. `0` disables. How fast the kernel gives up after that first probe depends on `TCP_KEEPINTVL`/`TCP_KEEPCNT`, which Node does not expose per-socket — tuning those is the paired lue-kube (pod `sysctls`) change, not this one. |
+| `PAPERCLIP_DB_SOCKET_TIMEOUT_MS` | derived from `statement_timeout` (comfortably above it; `10` minutes when `statement_timeout` is disabled) | Client-side backstop that does not depend on OS keepalive tuning at all: destroys a pooled socket after this many ms without a single byte *read* from the peer, forcing postgres.js's existing reconnect path to replace it on the next query. Reads only, not reads-or-writes: postgres.js pipelines, so counting outbound writes would let every further query written onto an already-dead socket postpone the backstop indefinitely. Silence is measured from the socket's `bytesRead` counter rather than its `data` events, because postgres.js hands the socket to `tls.connect()` on an `sslmode=require` URL and the raw socket emits no `data` after that — a counter keeps working under the TLS wrap. The counter is sampled on a poll a tenth of the window long, and seeded the moment the dial completes, so a dead socket is reclaimed within roughly one window (not two, which is what one timer per window would cost: the last sample before the silence begins always still looks like activity). `0` disables. |
+| `PAPERCLIP_DB_CONNECT_TIMEOUT_SEC` | `10` | postgres.js `connect_timeout`. The driver default (30s) is tuned for an occasionally-slow network, not a repeatedly-unreachable failed-over primary; a shorter budget means a doomed connection attempt fails, and the next attempt (which may hit a now-healthy replica-turned-primary) starts sooner. `0` restores the driver default (the option is left unset rather than passed through as `0`, which postgres.js would read as "no connect timer at all"). With the socket factory below installed this bound also covers the TCP dial itself, which the driver's own `connect_timeout` does not: postgres.js starts its connect timer only after the factory has returned a socket. The upstream `DATABASE_CONNECT_TIMEOUT_SECONDS` knob still wins when set. |
+| `PAPERCLIP_AUTH_DB_TIMEOUT_MS` | `5000` | Application-level ceiling on a single auth DB lookup in `server/src/middleware/auth.ts` (`authDbLookup`, and `withAuthDbTimeout` for the calls that must not be replayed), including its own transient-connection retries. It bounds one lookup, not one request: a request that performs several sequential lookups (the agent-JWT branch does) is bounded by their sum, not by this single value. This is the layer that bounds the auth path at all: a connection recovery attempt that itself lands on another still-unreachable target has no bound of its own inside postgres.js (its handling of a first query on a brand-new connection retries silently until it either succeeds or the process exits), so this timeout is what turns a hung Bearer, agent-key, or browser-session request into a fast, clear failure instead of an indefinite hang. |
+
+`PAPERCLIP_DB_SOCKET_TIMEOUT_MS` is implemented via a custom postgres.js `socket` factory
+(`socketWithInactivityTimeout` in `packages/db/src/client.ts`) since there is no native
+driver option for it. That factory is installed only when the connection string is available to check *and* is
+**single-host**:
+postgres.js's custom-socket branch skips its own dial, and with it the per-connection host
+rotation (`hostIndex`) a comma-separated multi-host connection string relies on — a factory
+shared by the whole pool cannot reproduce a per-connection cursor without scattering fresh
+connections across hosts that may still be standbys. A multi-host URL therefore keeps the
+driver's dial, its rotation, and OS keepalive (`PAPERCLIP_DB_KEEPALIVE_SEC`) plus
+`PAPERCLIP_AUTH_DB_TIMEOUT_MS` as its failover backstops; the lue-kube topology this was
+written for uses the single rw service, so it gets all three layers. A caller that builds
+driver options without passing the URL (the host count cannot be verified) likewise keeps
+the driver's dial rather than assuming a single host. Because postgres.js's own dial is the
+branch that sets `socket.host` — which `secure()` reads back as the TLS handshake's
+`servername` — the factory sets `host`/`port` on the socket it returns, so SNI still reaches
+an endpoint that routes on it (Neon, Supavisor, an SNI-based ingress). The factory also
+honours a unix-domain-socket connection (`%2Fvar%2Frun%2Fpostgresql` in the URL authority,
+`PGHOST=/path`, or an explicit `path` option, all of which postgres.js resolves to
+`options.path`): the driver's own branch returns on `path` before `socket.connect(port,
+host)`, so without the same check the path would be TCP-dialled as a hostname and never
+resolve. `socket.host` stays unset there, matching the driver, so no SNI is sent for a
+filesystem path. See `packages/db/src/socket-inactivity-timeout.test.ts` for a
+simulated-failover regression test (a fake wire-protocol TCP server that completes the
+startup handshake and then goes silent, standing in for the dead switchover peer) and
+`server/src/__tests__/auth-db-lookup.test.ts` for the same scenario proven bounded at the
+auth layer, including the pathological case where the pool-level backstop's own retry
+lands on a connection that never gives up on its own.
+
+A dedicated, unauthenticated readiness endpoint exercises the same pool the Bearer/agent-key
+auth path draws from: `GET /api/health/auth-db` runs one `SELECT 1` through `authDbLookup`
+(bounded to the existing 3s health-probe timeout, not the general-purpose 5s default above)
+and returns `200 {"status":"ready"}` or `503 {"status":"not_ready"}` with no further detail.
+Wire this path into the k8s `readinessProbe` (paired lue-kube change) so a wedged auth-path
+connection pulls the pod out of rotation instead of continuing to accept traffic it cannot
+serve.
+
+The browser-session branch of `actorMiddleware` is bounded the same way: it draws from the
+same pool, so `resolveCloudTenantActor`, better-auth's own session resolution, and the
+session's instance-role/membership lookups all go through the same ceiling and answer
+`503 AUTH_DB_TIMEOUT` instead of hanging the board UI. A timeout while resolving the session
+is rethrown rather than swallowed into an anonymous actor: a switchover must read as a
+retryable 503, not as an expired cookie that logs every board user out. `resolveCloudTenantActor` and the two `activity_log` audit inserts take
+`withAuthDbTimeout` rather than `authDbLookup`: the first already owns its transient-connection
+replay, and replaying a committed audit INSERT whose reply was lost to the switchover would
+write a second, false row.
+
+The live-events WebSocket upgrade lane (`server/src/realtime/live-events-ws.ts`) reaches the
+same pool on every branch — the trusted-header cloud actor, the better-auth session and the
+role/membership lookups behind it, and the agent-key lookup with its `lastUsedAt` write — so
+`authorizeUpgrade` as a whole takes one `withAuthDbTimeout` bound rather than each resolver
+taking its own. Without it a switchover parks each upgrade socket indefinitely; with it the
+handler's existing rejection path refuses the upgrade and the browser reconnects.
+
+A request whose auth lookup hits `PAPERCLIP_AUTH_DB_TIMEOUT_MS` answers
+`503 {"error": …, "code": "AUTH_DB_TIMEOUT"}`, not a generic 500, so a caller (and anything
+watching the API) can tell a transiently unreachable database from a server bug and retry.
+That mapping also keeps a failover from flooding the crash-reporting sinks: `errorHandler`
+(`server/src/middleware/error-handler.ts`) recognizes the `AUTH_DB_TIMEOUT` code and emits a
+`logger.warn` instead of calling `reportCrash` -- Sentry/telemetry never see a burst of
+hundreds of identical, non-actionable crash events for what is an expected, transient
+condition during a switchover. Everything else is unchanged: one warn line per occurrence,
+the usual error context, and the usual access-log level. Every other 500-class error keeps
+the unchanged crash report as well.
+
+A pre-connect dial failure through `socketWithInactivityTimeout` (a refused connection, or
+the factory's own `connectTimeoutMs` firing) is also patched at the postgres.js level
+(`patches/postgres@3.4.9.patch`, `createSocket()` in `connection.js`): the driver's stock
+behavior on a rejected custom-socket-factory promise only rejects the pending query and
+never moves the connection out of its internal `connecting` queue, permanently stranding
+one pool slot per failed dial. Enough failed dials exhausts `max` and reproduces the same
+hang this whole change exists to eliminate, just at connection-open time instead of query
+time. The patch calls postgres.js's own `onclose` in that catch branch so the pool retries
+the connection on its next query instead of leaking the slot, and records the failed dial
+through the same `closedTime`/`retries`/`delay` bookkeeping `closed()` uses, so reconnect
+backoff still accumulates instead of re-dialling a refusing primary in a tight loop; see
+the pre-connect dial failure and backoff tests in
+`packages/db/src/socket-inactivity-timeout.test.ts`.
+
+**No per-request auth budget.** `PAPERCLIP_AUTH_DB_TIMEOUT_MS` bounds one lookup, so a
+request that makes several sequential lookups is bounded by their sum. The longest branch is
+an agent-JWT login: the board-API-key lookup, the agent-API-key lookup, the agent record,
+the run's identity row, `captureRunIdentity`, the legacy responsible-user lookup (only when
+the capture returns no context and the JWT carries no `responsible_user_id`), and the
+responsible user's memberships — up to seven in a row, so about **35 seconds** at the 5000ms
+default before the request fails. Every one of them still fails fast individually, and the
+common case is two or three, but a true per-request deadline (one budget consumed by all the
+lookups on the request) is a follow-up, not part of this change.
+
+**Known limitation:** a connection that goes silent *after* a query is already in flight on
+it (the core HOM-441 scenario) is not proactively destroyed the moment `authDbLookup` times
+out on that query -- the losing attempt is simply abandoned, and the connection stays parked
+in postgres.js's pool as "busy" until `PAPERCLIP_DB_SOCKET_TIMEOUT_MS`'s read-idle backstop
+fires on it independently (worst case, with defaults, ~5.5 minutes: `statement_timeout` +
+`DB_SOCKET_TIMEOUT_MARGIN_MS`). Every *caller* is still bounded by `authDbLookup` at
+`PAPERCLIP_AUTH_DB_TIMEOUT_MS` regardless -- no request ever hangs -- but a pool whose `max`
+is close to its steady-state concurrency could see a string of requests each draw one of
+these not-yet-reclaimed connections and time out in turn, before the backstop catches up.
+Actively destroying and replacing that one connection the moment its auth lookup times out
+would close this window, but doing so safely requires either threading a dedicated
+auth-path connection (and its own lifecycle) through every `authDbLookup` call site, or a
+registry mapping in-flight lookups back to the specific pooled connection they landed on --
+both larger than this fix's scope. Tracked as a follow-up.
+
 ## Migration authoring checklist
 
 The 0126 issue comment attribution backfill showed the failure mode this checklist is meant to prevent: each batch looked for the next rows with an unindexed predicate, so PostgreSQL repeatedly scanned the same table and the migration became O(n²) as the table grew.

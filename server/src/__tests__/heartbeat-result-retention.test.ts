@@ -300,7 +300,7 @@ describeEmbeddedPostgres("createDrizzleHeartbeatResultRetentionDb (real Postgres
      * a row with the microsecond precision production rows actually carry — a
      * JS `Date` can only express milliseconds, so seeding one produces a
      * `.000000` timestamp that round-trips losslessly and hides any
-     * cursor-precision bug. Pair it with `ageRun` to move the row into the past.
+     * cursor-precision bug. Pair it with `ageRuns` to move the row into the past.
      */
     createdAt?: Date;
     resultJson: Record<string, unknown> | null;
@@ -315,12 +315,23 @@ describeEmbeddedPostgres("createDrizzleHeartbeatResultRetentionDb (real Postgres
     });
   }
 
-  /** Move a seeded run into the past, preserving its sub-millisecond digits. */
-  async function ageRun(id: string, days: number) {
+  /**
+   * Move seeded runs to `days` before the fixed NOW, independent of the host
+   * clock. One whole-second shift, anchored on the newest row, is applied to
+   * every row, so each keeps its sub-second digits and their relative order.
+   */
+  async function ageRuns(ids: string[], days: number) {
+    const idArray = sql`ARRAY[${sql.join(
+      ids.map((id) => sql`${id}`),
+      sql`, `,
+    )}]::uuid[]`;
     await db.execute(
       sql`update heartbeat_runs
-          set created_at = created_at - ${`${days} days`}::interval
-          where id = ${id}::uuid`,
+          set created_at = created_at + (
+            ${daysAgo(days).toISOString()}::timestamptz
+            - (select date_trunc('second', max(created_at)) from heartbeat_runs where id = any(${idArray}))
+          )
+          where id = any(${idArray})`,
     );
   }
 
@@ -517,11 +528,11 @@ describeEmbeddedPostgres("createDrizzleHeartbeatResultRetentionDb (real Postgres
     const ids = [uuid(1), uuid(2), uuid(3)];
     for (const id of ids) {
       await seedRun({ id, companyId, agentId, resultJson: { stdout: "H".repeat(500) } });
-      // The fixture clock is intentionally fixed while the database default
-      // uses the host clock; age far enough to be unambiguously before the
-      // fixed 30-day cutoff on every test host while preserving microseconds.
-      await ageRun(id, 60);
     }
+    // The database default uses the host clock while the fixture clock is
+    // fixed; re-anchor the rows 60 days before NOW so they sit before the
+    // fixed 30-day cutoff on any host date, keeping their microseconds.
+    await ageRuns(ids, 60);
 
     const [{ subMs }] = (await db.execute(sql`
       select count(*) filter (

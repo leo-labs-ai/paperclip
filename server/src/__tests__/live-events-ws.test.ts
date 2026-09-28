@@ -180,4 +180,30 @@ describe("setupLiveEventsWebSocketServer", () => {
     expect(resolveSessionFromHeaders).toHaveBeenCalledTimes(1);
     expect(socket.endedChunks[0]).toContain("403 Forbidden");
   });
+
+  it("refuses the upgrade when auth resolution stalls past the auth DB timeout (HOM-441)", async () => {
+    const previous = process.env.PAPERCLIP_AUTH_DB_TIMEOUT_MS;
+    process.env.PAPERCLIP_AUTH_DB_TIMEOUT_MS = "80";
+    try {
+      const server = new EventEmitter();
+      setupLiveEventsWebSocketServer(server as never, {} as never, {
+        deploymentMode: "authenticated",
+        resolveSessionFromHeaders: () => new Promise(() => {}),
+        resolveCloudActor: () => new Promise(() => {}),
+      });
+      const socket = new FakeUpgradeSocket();
+
+      const startedAt = Date.now();
+      server.emit("upgrade", createUpgradeRequest(), socket as unknown as Duplex, Buffer.alloc(0));
+      while (socket.endedChunks.length === 0 && Date.now() - startedAt < 3_000) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(socket.endedChunks[0]).toContain("500 Internal Server Error");
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_AUTH_DB_TIMEOUT_MS;
+      else process.env.PAPERCLIP_AUTH_DB_TIMEOUT_MS = previous;
+    }
+  }, 10_000);
 });

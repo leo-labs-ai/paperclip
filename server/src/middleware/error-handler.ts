@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from "express";
 import type { Db } from "@paperclipai/db";
 import { ZodError } from "zod";
-import { HttpError } from "../errors.js";
+import { HttpError, serviceUnavailable } from "../errors.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { captureException } from "../sentry.js";
@@ -91,6 +91,23 @@ function reportCrash(error: Error): void {
   captureException(error);
 }
 
+/**
+ * `AUTH_DB_TIMEOUT` (see `AuthDbTimeoutError` in middleware/auth.ts) means a
+ * Bearer/agent-key auth DB lookup hit its bound -- the expected, transient
+ * shape of a database failover in progress, not a server bug. A CloudNativePG
+ * primary switchover can make every in-flight auth request hit this at once,
+ * and `reportCrash()` (Sentry + telemetry) firing once per request would
+ * flood those sinks with a burst of identical, non-actionable crash events at
+ * exactly the moment an operator needs real signal, instead of the ordinary
+ * traffic-shaped signal a transient 503 should produce.
+ */
+function logAuthDbTimeoutWarning(error: Error): void {
+  logger.warn(
+    { err: error },
+    "auth database lookup timed out (503) -- reported as a warning, not a crash, because this is the expected shape of an in-progress failover",
+  );
+}
+
 function getPaperclipDb(req: Request): Db | null {
   const locals = req.app?.locals as { paperclipDb?: Db; db?: Db } | undefined;
   return locals?.paperclipDb ?? locals?.db ?? null;
@@ -128,6 +145,18 @@ export function errorHandler(
   res: Response,
   _next: NextFunction,
 ) {
+  // An auth DB lookup that hit its ceiling (`AuthDbTimeoutError` in
+  // middleware/auth.ts) means the database is transiently unreachable, not
+  // that the server is broken: answer 503 with the stable code so clients and
+  // the k8s stack can tell the two apart and retry. Matched on the code rather
+  // than the class to keep this module free of an import cycle through auth.
+  if (
+    err instanceof Error &&
+    (err as { code?: unknown }).code === "AUTH_DB_TIMEOUT"
+  ) {
+    err = serviceUnavailable(err.message, { code: "AUTH_DB_TIMEOUT" });
+  }
+
   if (err instanceof HttpError) {
     const details =
       err.details &&
@@ -176,7 +205,8 @@ export function errorHandler(
             },
         reportableError,
       );
-      reportCrash(reportableError);
+      if (details?.code === "AUTH_DB_TIMEOUT") logAuthDbTimeoutWarning(reportableError);
+      else reportCrash(reportableError);
     }
     const secretSensitiveServerError =
       err.status >= 500 &&
