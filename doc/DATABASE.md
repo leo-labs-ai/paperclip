@@ -588,3 +588,10 @@ cleanup authority; it does not prove that remote inference has stopped. Recovery
 revokes the previous boot identity with a conditional update. Its own claim also
 expires so another sweep can finish cleanup after a restart. Historical rows keep
 null ownership fields and follow the previous recovery path.
+
+## Recovery Query Predicates on `heartbeat_runs`
+
+Recovery scans (`conversation-continuation.ts`, `execution-recovery-resolution.ts`) must keep predicates indexable, because `heartbeat_runs` rows carry large TOAST-backed `result_json`:
+
+- Issue linkage is `native_issue_id = $issue OR (native_issue_id IS NULL AND context_snapshot->>'issueId' = $issue::text)` (`runIssueLinkPredicate`), never `coalesce(native_issue_id::text, ...)`, which defeats the `(company_id, native_issue_id, ...)` indexes.
+- Evidence joins compare the bare PK: `heartbeat_runs.id = CASE WHEN evidence->>'runId' ~ <canonical lowercase uuid> THEN (evidence->>'runId')::uuid END` (`runIdMatchesEvidence`), never `id::text = evidence->>'runId'`. Malformed or non-canonical evidence matches nothing and cannot raise a cast error.
