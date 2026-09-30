@@ -5,6 +5,7 @@
 // HTTP server, so trace coverage does not depend on incidental timing.
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
 import { describeError } from "./lib/describe-error.js";
+import { createSingleFlightTask } from "./lib/single-flight-task.js";
 import { sentryReady, shutdownSentry, captureException } from "./sentry.js";
 import { waitForPendingRunFailureReports } from "./services/run-failure-report.js";
 import { verifyStoppedNativeSessionForReplacement } from "./services/native-runtime/native-session-executor.js";
@@ -1203,6 +1204,10 @@ async function startServerWithDatabaseTeardown(
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
+  // Slow recovery and full-feed retention must not multiply shared-pool work.
+  // Separate gates leave timers and independent durable queues progressing.
+  const runHeartbeatRecoverySingleFlight = createSingleFlightTask();
+  const runRetentionSingleFlight = createSingleFlightTask();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
     tracked = Promise.resolve(work)
@@ -1636,23 +1641,29 @@ async function startServerWithDatabaseTeardown(
       await startupHeartbeatRecovery;
     }
 
-    const runRetentionSweep = async () => {
-      const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
-      let archived = 0;
-      for (const company of activeCompanies) {
-        // Cursor pagination rebuilds the whole feed for every page; one
-        // unscoped all-items build keeps this sweep at a single feed build
-        // per company per tick.
-        const page = await attentionService(db as any).list(company.id, {
-          includeDismissed: true,
-          all: true,
-          allowUnscopedAll: true,
-        });
-        archived += await retentionExecutor.autoArchive({ companyId: company.id, items: page.items });
+    const runRetentionSweep = () => runRetentionSingleFlight(async () => {
+      if (heartbeatSchedulerStopped) return;
+      const startedAt = Date.now();
+      try {
+        const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
+        let archived = 0;
+        for (const company of activeCompanies) {
+          // Cursor pagination rebuilds the whole feed for every page; one
+          // unscoped all-items build keeps this sweep at a single feed build
+          // per company per tick.
+          const page = await attentionService(db as any).list(company.id, {
+            includeDismissed: true,
+            all: true,
+            allowUnscopedAll: true,
+          });
+          archived += await retentionExecutor.autoArchive({ companyId: company.id, items: page.items });
+        }
+        const notifications = await retentionExecutor.deliverNotifications();
+        return { archived, ...notifications };
+      } finally {
+        logger.info({ durationMs: Date.now() - startedAt }, "decision retention sweep finished");
       }
-      const notifications = await retentionExecutor.deliverNotifications();
-      return { archived, ...notifications };
-    };
+    });
 
     // Once-at-startup sweeps: do not block bind. Per-step try/catch so one
     // failure cannot skip lease/reaper cleanup. Interval below is steady-state.
@@ -1699,7 +1710,7 @@ async function startServerWithDatabaseTeardown(
       // Retry orphan sandbox teardown left by a failed acquire across restart.
       await runEnvironmentLeaseCleanupSweep(0);
 
-      await runRetentionSweep().catch((err) => {
+      await runRetentionSweep()?.catch((err) => {
         logger.error({ err }, "startup decision retention sweep failed");
       });
     })());
@@ -1713,9 +1724,14 @@ async function startServerWithDatabaseTeardown(
         trackHeartbeatSchedulerWork(decisionExecutor.sweepExpired().catch((err: unknown) => {
           logger.error({ err }, "decision expiry sweep failed");
         }));
-        trackHeartbeatSchedulerWork(runRetentionSweep().catch((err: unknown) => {
-          logger.error({ err }, "decision retention sweep failed");
-        }));
+        const retentionWork = runRetentionSweep();
+        if (retentionWork) {
+          trackHeartbeatSchedulerWork(retentionWork.catch((err: unknown) => {
+            logger.error({ err }, "decision retention sweep failed");
+          }));
+        } else {
+          logger.warn("decision retention tick skipped while prior sweep is running");
+        }
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
           logger.info(
@@ -1840,53 +1856,65 @@ async function startServerWithDatabaseTeardown(
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
-          trackHeartbeatSchedulerWork(heartbeat
-            .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
-            .then(() => heartbeat.promoteDueScheduledRetries())
-            .then(async (promotion) => {
-              await heartbeat.resumeQueuedRuns();
-              const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-              if (
-                promotion.promoted > 0 ||
-                reconciled.assignmentDispatched > 0 ||
-                reconciled.dispatchRequeued > 0 ||
-                reconciled.continuationRequeued > 0 ||
-                reconciled.successfulRunHandoffEscalated > 0 ||
-                reconciled.escalated > 0
-              ) {
-                logger.warn(
-                  { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
-                  "periodic heartbeat recovery changed assigned issue state",
-                );
-              }
-            })
-            .then(async () => {
-              const reconciled = await heartbeat.reconcileResolvedDependencyWakes();
-              if (reconciled.healed > 0) {
-                logger.warn({ ...reconciled }, "periodic dependency-wake reconciliation restored task execution paths");
-              }
-            })
-            .then(async () => {
-              const reconciled = await heartbeat.reconcileTaskWatchdogs();
-              if (reconciled.triggered > 0) {
-                logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
-              }
-            })
-            .then(async () => {
-              const scanned = await heartbeat.scanSilentActiveRuns();
-              if (scanned.created > 0 || scanned.escalated > 0) {
-                logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
-              }
-            })
-            .then(async () => {
-              const swept = await heartbeat.sweepStaleIssueLocks();
-              if (swept.cleared > 0) {
-                logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
-              }
-            })
-            .catch((err) => {
-              logger.error({ err }, "periodic heartbeat recovery failed");
-            }));
+          const recoveryWork = runHeartbeatRecoverySingleFlight(async () => {
+            if (heartbeatSchedulerStopped) return;
+            const startedAt = Date.now();
+            await heartbeat
+              .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+              .then(() => heartbeat.promoteDueScheduledRetries())
+              .then(async (promotion) => {
+                await heartbeat.resumeQueuedRuns();
+                const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+                if (
+                  promotion.promoted > 0 ||
+                  reconciled.assignmentDispatched > 0 ||
+                  reconciled.dispatchRequeued > 0 ||
+                  reconciled.continuationRequeued > 0 ||
+                  reconciled.successfulRunHandoffEscalated > 0 ||
+                  reconciled.escalated > 0
+                ) {
+                  logger.warn(
+                    { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
+                    "periodic heartbeat recovery changed assigned issue state",
+                  );
+                }
+              })
+              .then(async () => {
+                const reconciled = await heartbeat.reconcileResolvedDependencyWakes();
+                if (reconciled.healed > 0) {
+                  logger.warn({ ...reconciled }, "periodic dependency-wake reconciliation restored task execution paths");
+                }
+              })
+              .then(async () => {
+                const reconciled = await heartbeat.reconcileTaskWatchdogs();
+                if (reconciled.triggered > 0) {
+                  logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
+                }
+              })
+              .then(async () => {
+                const scanned = await heartbeat.scanSilentActiveRuns();
+                if (scanned.created > 0 || scanned.escalated > 0) {
+                  logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
+                }
+              })
+              .then(async () => {
+                const swept = await heartbeat.sweepStaleIssueLocks();
+                if (swept.cleared > 0) {
+                  logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+                }
+              })
+              .catch((err) => {
+                logger.error({ err }, "periodic heartbeat recovery failed");
+              })
+              .finally(() => {
+                logger.info({ durationMs: Date.now() - startedAt }, "periodic heartbeat recovery sweep finished");
+              });
+          });
+          if (recoveryWork) {
+            trackHeartbeatSchedulerWork(recoveryWork);
+          } else {
+            logger.warn("periodic heartbeat recovery tick skipped while prior sweep is running");
+          }
         }
       })().catch((err) => {
         logger.error({ err }, "heartbeat scheduler tick failed");
