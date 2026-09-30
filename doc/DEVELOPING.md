@@ -1465,6 +1465,16 @@ limit. Legacy `paperclip_plugin` placeholder connections are excluded: their
 tools run in plugin workers and do not have remote MCP endpoints. These rows
 remain available; the sweep does not disable or delete plugin connections.
 
+The periodic heartbeat recovery chain and decision-retention sweep each admit
+only one in-flight pass per server process. Busy ticks are skipped, not queued;
+the next regular tick retries after completion or failure. Startup retention
+shares the same gate. Timers and independent execution-control queues keep their
+own scheduling, and shutdown still drains admitted work. These gates do not
+fence multiple replicas or reduce the cost of one pass. Server logs record each
+completed sweep's duration and warn when a busy tick is skipped; neither log
+contains issue/run payloads. Use these alongside authenticated response timing
+to investigate pool contention rather than infer service recovery from readiness.
+
 When investigating an overloaded instance, distinguish request amplification
 from stored configuration problems. Verify connection transport and endpoint
 fields before disabling a connection. Verify workspace ownership, active runs,
