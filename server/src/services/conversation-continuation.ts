@@ -25,6 +25,24 @@ export function claimedAdapterType(run: Pick<typeof heartbeatRuns.$inferSelect, 
   return typeof dispatch?.adapterType === "string" ? dispatch.adapterType : null;
 }
 
+const CANONICAL_UUID_RE = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+
+/** Run linkage to an issue. Indexable form of coalesce(native_issue_id::text, context->>'issueId') = issue. */
+export function runIssueLinkPredicate(issueId: unknown) {
+  return or(
+    sql`${heartbeatRuns.nativeIssueId} = ${issueId}`,
+    and(
+      sql`${heartbeatRuns.nativeIssueId} is null`,
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}::text`,
+    ),
+  );
+}
+
+/** heartbeat_runs.id = evidence.runId without casting the PK. Non-canonical evidence never matches and never errors. */
+export function runIdMatchesEvidence(evidence: unknown) {
+  return sql`${heartbeatRuns.id} = case when ${evidence}->>'runId' ~ ${CANONICAL_UUID_RE} then (${evidence}->>'runId')::uuid end`;
+}
+
 function conversationRunPredicate() {
   return or(
     inArray(sql`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`, [...CONVERSATION_ADAPTER_TYPES]),
@@ -67,8 +85,8 @@ export function conversationRecoveryActionPredicate() {
     sql`exists (
       select 1 from ${heartbeatRuns}
       where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}
-        and ${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'
-        and coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueRecoveryActions.sourceIssueId}::text
+        and ${runIdMatchesEvidence(issueRecoveryActions.evidence)}
+        and ${runIssueLinkPredicate(issueRecoveryActions.sourceIssueId)}
         and ${heartbeatRuns.runtimeMode} = 'legacy'
         and ${inArray(heartbeatRuns.status, ['failed', 'timed_out', 'interrupted', 'cancelled'])}
         and ${conversationRunPredicate()}
@@ -106,7 +124,7 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
     .where(and(
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.runtimeMode, "legacy"),
       conversationRunPredicate(),
-      sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueId}`,
+      runIssueLinkPredicate(issueId),
       inArray(heartbeatRuns.status, ["failed", "timed_out", "interrupted", "cancelled"]),
       or(isNotNull(heartbeatRuns.processPid), isNotNull(heartbeatRuns.processGroupId), activeLease),
     )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
