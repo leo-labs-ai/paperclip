@@ -4,7 +4,6 @@
 // instrumentationReady before opening DB connections or constructing the
 // HTTP server, so trace coverage does not depend on incidental timing.
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
-import { describeError } from "./lib/describe-error.js";
 import { createSingleFlightTask } from "./lib/single-flight-task.js";
 import { sentryReady, shutdownSentry, captureException } from "./sentry.js";
 import { waitForPendingRunFailureReports } from "./services/run-failure-report.js";

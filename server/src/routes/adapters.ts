@@ -45,7 +45,7 @@ import type {
   AdapterLoginPanelMode,
   AdapterLoginTimeoutPolicy,
 } from "@paperclipai/adapter-utils";
-import { loadExternalAdapterPackage, getUiParserSource, getOrExtractUiParserSource, reloadExternalAdapter } from "../adapters/plugin-loader.js";
+import { loadExternalAdapterPackage, getOrExtractUiParserSource, reloadExternalAdapter } from "../adapters/plugin-loader.js";
 import { logger } from "../middleware/logger.js";
 import { forbidden } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
