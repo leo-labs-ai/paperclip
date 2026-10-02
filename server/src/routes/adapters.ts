@@ -23,7 +23,6 @@ import {
   listServerAdapters,
   findServerAdapter,
   findActiveServerAdapter,
-  listEnabledServerAdapters,
   registerServerAdapter,
   resolveExternalAdapterRegistration,
   unregisterServerAdapter,

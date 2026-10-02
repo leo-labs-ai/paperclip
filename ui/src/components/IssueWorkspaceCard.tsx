@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "@/lib/router";
 import type { Issue, ExecutionWorkspace } from "@paperclipai/shared";
 import { useQuery } from "@tanstack/react-query";
@@ -15,7 +15,6 @@ import {
   buildWorkspaceSelectionUpdate,
   currentWorkspaceSelection,
 } from "../lib/issue-workspace-selection";
-import { orderReusableExecutionWorkspaces } from "../lib/reusable-execution-workspaces";
 import { cn, projectWorkspaceUrl } from "../lib/utils";
 import { Button } from "@/components/ui/button";
 import { Check, Copy, FileSearch, FolderOpen, FolderSearch, GitBranch, Pencil, X } from "lucide-react";
