@@ -10,7 +10,6 @@ import {
   ISSUE_DETAIL_STALE_TIME_MS,
   prefetchIssueDetailForNavigation,
 } from "@/lib/issueDetailCache";
-import { queryKeys } from "@/lib/queryKeys";
 import { cn } from "@/lib/utils";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { StatusGlyph } from "@/components/StatusGlyph";
