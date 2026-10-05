@@ -6,7 +6,6 @@ import type {
 import {
   asNumber,
   asString,
-  asStringArray,
   ensurePathInEnv,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
