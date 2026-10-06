@@ -67,7 +67,6 @@ import type {
   AgentSessionEvent,
 } from "./types.js";
 import type {
-  JsonRpcId,
   JsonRpcNotification,
   JsonRpcRequest,
   JsonRpcResponse,
@@ -118,7 +117,6 @@ import {
   LOGIN_PTY_EXIT_NOTIFICATION,
   DUPLEX_CHANNEL_DATA_NOTIFICATION,
   DUPLEX_CHANNEL_EXIT_NOTIFICATION,
-  JSONRPC_VERSION,
   JSONRPC_ERROR_CODES,
   PLUGIN_RPC_ERROR_CODES,
   createRequest,
