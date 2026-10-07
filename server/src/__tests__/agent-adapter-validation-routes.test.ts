@@ -79,6 +79,10 @@ const mockRemoteAgentProfileService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
+const mockValidatePiModel = vi.hoisted(() =>
+  vi.fn(async (): Promise<{ status: string; message?: string; reason?: string }> => ({ status: "valid" })),
+);
+
 vi.mock("../services/index.js", () => ({
   agentService: () => mockAgentService,
   agentInstructionsService: () => mockAgentInstructionsService,
@@ -128,6 +132,11 @@ function registerModuleMocks() {
     secretService: () => mockSecretService,
     syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
     workspaceOperationService: () => ({}),
+  }));
+
+  vi.doMock("@paperclipai/adapter-pi-local/server", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("@paperclipai/adapter-pi-local/server")>()),
+    validatePiModelForPersistence: mockValidatePiModel,
   }));
 
   vi.doMock("../services/instance-settings.js", () => ({
@@ -248,6 +257,7 @@ describe("agent routes adapter validation", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue([]);
+    mockValidatePiModel.mockResolvedValue({ status: "valid" });
     mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
     mockCompanySkillService.resolveRequestedSkillKeys.mockResolvedValue([]);
     mockAccessService.canUser.mockResolvedValue(true);
@@ -1140,5 +1150,61 @@ describe("agent routes adapter validation", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockAgentService.update).toHaveBeenCalledOnce();
+  });
+
+  it("rejects creating a pi_local agent whose model Pi/ClawRouter cannot resolve", async () => {
+    mockValidatePiModel.mockResolvedValue({
+      status: "invalid",
+      message: "Configured Pi model is unavailable: clawrouter/gpt-5.6-luna. Did you mean: clawrouter/gpt-5.6-luna-200k?",
+    });
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post("/api/companies/company-1/agents")
+        .send({ name: "Pi", adapterType: "pi_local", adapterConfig: { model: "clawrouter/gpt-5.6-luna" } }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(JSON.stringify(res.body)).toContain("Did you mean: clawrouter/gpt-5.6-luna-200k");
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+  });
+
+  it("creates a pi_local agent when the model catalog is unreachable (fail-open)", async () => {
+    mockValidatePiModel.mockResolvedValue({ status: "unverified", reason: "timed out" });
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post("/api/companies/company-1/agents")
+        .send({ name: "Pi", adapterType: "pi_local", adapterConfig: { model: "clawrouter/gpt-5.6-luna-200k" } }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+  });
+
+  it("rejects changing a pi_local agent to an unknown model but allows edits that keep the model", async () => {
+    const base = await mockAgentService.getById();
+    mockAgentService.getById.mockResolvedValue({
+      ...base,
+      adapterType: "pi_local",
+      adapterConfig: { model: "clawrouter/legacy-model" },
+    });
+    mockValidatePiModel.mockResolvedValue({ status: "invalid", message: "Configured Pi model is unavailable" });
+    const app = await createApp();
+
+    const changed = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterConfig: { model: "clawrouter/typo" } }),
+    );
+    expect(changed.status, JSON.stringify(changed.body)).toBe(422);
+
+    mockValidatePiModel.mockClear();
+    const unchanged = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterConfig: { model: "clawrouter/legacy-model", cwd: "/tmp" } }),
+    );
+    expect(unchanged.status, JSON.stringify(unchanged.body)).toBe(200);
+    expect(mockValidatePiModel).not.toHaveBeenCalled();
   });
 });
