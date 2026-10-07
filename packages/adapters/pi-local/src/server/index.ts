@@ -56,6 +56,10 @@ export {
   discoverPiModels,
   discoverPiModelsCached,
   ensurePiModelConfiguredAndAvailable,
+  findClosePiModelMatches,
+  formatPiModelUnavailableMessage,
+  validatePiModelForPersistence,
   resetPiModelsCacheForTests,
 } from "./models.js";
+export type { PiModelPersistenceValidation } from "./models.js";
 export { parsePiJsonl, isPiUnknownSessionError } from "./parse.js";
