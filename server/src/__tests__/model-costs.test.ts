@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  CLAWROUTER_CLAUDE_OPUS_5_5_PRICING,
   CLAWROUTER_GPT_5_6_TERRA_PRICING,
+  CLAWROUTER_GPT_6_LUNA_PRICING,
+  CLAWROUTER_GPT_6_SOL_PRICING,
   normalizeModelCostCents,
   resolveCostEventCostCents,
   resolveModelCostCents,
@@ -163,6 +166,77 @@ describe("fleet model rate coverage (fork)", () => {
     expect(cost("clawrouter/gpt-5.6-terra")).toBe(1400);
     expect(cost("clawrouter/gpt-5.6-sol")).toBe(3500);
     expect(cost("clawrouter/gpt-5.6-terra-pro")).toBe(1400);
+  });
+
+  it.each([
+    ["clawrouter/gpt-6-sol-200k", 140],
+    ["clawrouter/gpt-6-luna-200k", 7],
+    ["clawrouter/claude-opus-5-5-200k", 280],
+  ])("prices a short-context request for %s", (model, expectedCostCents) => {
+    expect(
+      resolveCostEventCostCents({
+        costCents: 0,
+        billingType: "subscription_included",
+        provider: "clawrouter",
+        model,
+        inputTokens: 200_000,
+        cachedInputTokens: 0,
+        outputTokens: 100_000,
+      }),
+    ).toBe(expectedCostCents);
+  });
+
+  it.each([
+    ["clawrouter/gpt-6-sol-200k", 20, 250],
+    ["clawrouter/gpt-6-luna-200k", 1, 13],
+    ["clawrouter/claude-opus-5-5-200k", 20, 800],
+  ])("prices cached reads and cache writes for %s", (model, cachedCostCents, writeCostCents) => {
+    const estimate = (cachedInputTokens: number, cacheCreationInputTokens: number) =>
+      resolveCostEventCostCents({
+        costCents: 0,
+        billingType: "subscription_included",
+        provider: "clawrouter",
+        model,
+        inputTokens: 0,
+        cachedInputTokens,
+        cacheCreationInputTokens,
+        outputTokens: 0,
+      });
+    expect(estimate(1_000_000, 0)).toBe(cachedCostCents);
+    expect(estimate(0, 1_000_000)).toBe(writeCostCents);
+  });
+
+  it("pins GPT-6 and Opus 5.5 fallback pricing to official sources", () => {
+    expect(CLAWROUTER_GPT_6_SOL_PRICING).toMatchObject({
+      pricingRef: "openai-gpt-6-sol-standard-2026-09-22",
+      effectiveAt: "2026-09-22",
+      rates: {
+        inputMicrosPerMillion: 2_000_000,
+        cachedInputMicrosPerMillion: 200_000,
+        outputMicrosPerMillion: 10_000_000,
+        cacheWriteMultiplier: 1.25,
+      },
+    });
+    expect(CLAWROUTER_GPT_6_LUNA_PRICING).toMatchObject({
+      pricingRef: "openai-gpt-6-luna-standard-2026-09-22",
+      effectiveAt: "2026-09-22",
+      rates: {
+        inputMicrosPerMillion: 100_000,
+        cachedInputMicrosPerMillion: 10_000,
+        outputMicrosPerMillion: 500_000,
+        cacheWriteMultiplier: 1.25,
+      },
+    });
+    expect(CLAWROUTER_CLAUDE_OPUS_5_5_PRICING).toMatchObject({
+      pricingRef: "anthropic-claude-opus-5-5-standard-2026-09-22",
+      effectiveAt: "2026-09-22",
+      rates: {
+        inputMicrosPerMillion: 4_000_000,
+        cachedInputMicrosPerMillion: 200_000,
+        outputMicrosPerMillion: 20_000_000,
+        cacheWriteMultiplier: 2,
+      },
+    });
   });
 
   it("pins the Terra fallback to the official July 30, 2026 pricing", () => {
