@@ -100,7 +100,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       title: overrides.title ?? "Watched issue",
       status: overrides.status ?? "done",
       priority: overrides.priority ?? "medium",
-      identifier: overrides.identifier ?? `WDOG-${Math.floor(Math.random() * 10_000)}`,
+      identifier: overrides.identifier ?? `WDOG-${id}`,
       issueNumber: overrides.issueNumber ?? Math.floor(Math.random() * 10_000),
       parentId: overrides.parentId,
       assigneeAgentId: overrides.assigneeAgentId,

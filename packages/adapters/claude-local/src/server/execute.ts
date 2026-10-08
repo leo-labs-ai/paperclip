@@ -1,3 +1,4 @@
+import { resolveClaudeExecutionRoute, claudeRouteExecutionFailure } from "./clawrouter-route.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -402,6 +403,9 @@ export async function runClaudeLogin(input: {
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  const route = resolveClaudeExecutionRoute(ctx);
+  if (route.error !== undefined) return claudeRouteExecutionFailure(route.error);
+  ctx = { ...ctx, config: route.config };
   const engineSelection = await resolveClaudeExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
     return {
