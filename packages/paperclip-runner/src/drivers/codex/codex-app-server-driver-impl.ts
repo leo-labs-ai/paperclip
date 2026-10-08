@@ -18,7 +18,6 @@ import type {
   PersistedHarnessTurnTerminal,
 } from "../../contracts/harness-driver.js";
 import { NativeSessionProtocolIntegrityError } from "../../contracts/native-session-backend.js";
-import { HarnessReconciliationError } from "../../contracts/harness-driver.js";
 import {
   CODEX_CODEX_PROTOCOL_VERSION,
   CODEX_SKILLLESS_BASE_INSTRUCTIONS,
@@ -42,11 +41,9 @@ import {
   createIsolatedCodexAppServerArgs,
   codexNetworkAccess,
   createSecuredCodexThreadParams,
-  createSkilllessCodexThreadConfig,
 } from "./codex-security-config.js";
 import {
   codexThreadLineage as lineageFromThread,
-  codexThreadStatus as threadStatus,
   parseCodexThreadGoal as parseThreadGoal,
 } from "./codex-thread-normalization.js";
 import { CodexHarnessSession } from "./codex-harness-session.js";
@@ -60,7 +57,6 @@ import {
   boundedText,
   canonicalJson,
   codexSemanticToolSpecs,
-  differingJsonPaths,
   parseProviderIdentity,
   record,
   text,
