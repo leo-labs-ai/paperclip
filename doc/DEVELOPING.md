@@ -1173,6 +1173,18 @@ schemas. Defaults:
 - retain 30 days
 - backup dir: `~/.paperclip/instances/default/data/backups`
 
+Backups are written to private `0600` files with a `.partial` suffix. The writer
+renames the gzip to its final `.sql.gz` name only after the dump and compression
+finish. Retention and health checks ignore partial files. Health also ignores
+empty gzip files left by older writers; freshness is not a full integrity check.
+Backup names include a unique suffix so concurrent runs do not share a file.
+
+The production image includes PostgreSQL 17 client tools. `pg_dump` streams SQL
+directly into gzip. If the client is missing or cannot dump the server version,
+automatic mode uses the JavaScript exporter. That fallback needs space for both
+the temporary SQL and gzip. Connection strings are passed to client tools through
+`PGDATABASE`, not process arguments. Restore still accepts existing SQL backups.
+
 Automatic backups are disabled for isolated worktree instances created with
 `paperclipai worktree init` or `paperclipai worktree:make`. Existing worktree
 configs are migrated to the disabled setting when their server next starts. The
