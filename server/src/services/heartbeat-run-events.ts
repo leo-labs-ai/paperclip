@@ -63,16 +63,25 @@ export async function allocateHeartbeatRunEventSeq(
   db: Db,
   runId: string,
 ): Promise<number> {
-  const [updated] = await db
-    .update(heartbeatRuns)
-    .set({
-      nextEventSeq: sql`${heartbeatRuns.nextEventSeq} + 1`,
-      updatedAt: new Date(),
-    })
-    .where(eq(heartbeatRuns.id, runId))
-    .returning({ nextEventSeq: heartbeatRuns.nextEventSeq });
-  if (!updated) throw new Error("heartbeat_run_event_binding_mismatch");
-  return Number(updated.nextEventSeq) - 1;
+  return db.transaction(async (tx) => {
+    const [run] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId)).for("update").limit(1);
+    if (!run) throw new Error("heartbeat_run_event_binding_mismatch");
+    // Read persisted evidence after acquiring the lock, in a new statement.
+    // A writer we waited for may have committed beyond the stored counter.
+    const [updated] = await tx
+      .update(heartbeatRuns)
+      .set({
+        nextEventSeq: sql`greatest(${heartbeatRuns.nextEventSeq}, coalesce((
+          select max(${heartbeatRunEvents.seq}) + 1 from ${heartbeatRunEvents}
+          where ${heartbeatRunEvents.runId} = ${runId}
+        ), 1)) + 1`,
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, runId))
+      .returning({ nextEventSeq: heartbeatRuns.nextEventSeq });
+    return Number(updated!.nextEventSeq) - 1;
+  });
 }
 
 export async function appendHeartbeatRunEvent(
