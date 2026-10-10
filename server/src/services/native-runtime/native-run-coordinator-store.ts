@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { and, desc, eq, inArray, lt } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
+import { allocateHeartbeatRunEventSeq } from "../heartbeat-run-events.js";
 import {
   heartbeatRunEvents,
   heartbeatRuns,
@@ -289,7 +290,7 @@ export class NativeRunCoordinatorStore {
         throw new Error("native_event_source_gap");
       }
 
-      const cursor = run.nextEventSeq;
+      const cursor = await allocateHeartbeatRunEventSeq(tx as unknown as Db, this.#binding.runId);
       const [inserted] = await tx
         .insert(heartbeatRunEvents)
         .values({
@@ -309,10 +310,6 @@ export class NativeRunCoordinatorStore {
         })
         .returning({ seq: heartbeatRunEvents.seq });
       if (!inserted) throw new Error("native_event_not_persisted");
-      await tx
-        .update(heartbeatRuns)
-        .set({ nextEventSeq: cursor + 1, updatedAt: new Date() })
-        .where(eq(heartbeatRuns.id, this.#binding.runId));
       return {
         disposition: "committed" as const,
         cursor: inserted.seq,
