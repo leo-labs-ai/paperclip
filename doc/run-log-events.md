@@ -5,6 +5,14 @@ Run-log events write to the `heartbeat_run_events` table
 Paperclip Telemetry events, and they are not OpenTelemetry exports. A run-log
 event needs no operator endpoint.
 
+## Per-Run Sequence Allocation
+
+Legacy writers and the native coordinator share the run-row sequence allocator.
+Under the run lock, it reserves the greater of `next_event_seq` and the highest
+persisted event sequence plus one. A trailing counter is repaired only when a
+new event is allocated; existing evidence and replay identities are unchanged.
+The counter reservation rolls back with a failed append or recovery settlement.
+
 ## Native PRP Run-Log Events
 
 The hidden native coordinator writes each validated PRP event to the bound
