@@ -11,7 +11,6 @@ import type {
 } from "../mock-core/capability-control-plane-types.js";
 import { CapabilitySemanticDispatcher } from "../semantic-tools/dispatcher.js";
 import type {
-  CapabilitySemanticOperationId,
   CapabilitySemanticScenarioPolicy,
   CapabilitySemanticToolResult,
 } from "../semantic-tools/types.js";

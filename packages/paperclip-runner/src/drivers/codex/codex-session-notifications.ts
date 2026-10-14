@@ -28,7 +28,6 @@ import {
   recordWorkspaceChanges,
 } from "./codex-session-workspace.js";
 import {
-  boundedText,
   differingJsonPaths,
   itemFromParams,
   itemText,

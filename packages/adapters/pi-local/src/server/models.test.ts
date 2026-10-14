@@ -7,7 +7,10 @@ import {
   discoverPiModels,
   discoverPiModelsCached,
   ensurePiModelConfiguredAndAvailable,
+  findClosePiModelMatches,
+  formatPiModelUnavailableMessage,
   listPiModels,
+  validatePiModelForPersistence,
   piModelsCacheSizeForTests,
   resetPiModelsCacheForTests,
 } from "./models.js";
@@ -314,5 +317,79 @@ describe("pi models", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("lists close matches first and every available model in the unavailable error", () => {
+    const models = Array.from({ length: 20 }, (_, i) => ({ id: `aaa/model-${String(i).padStart(2, "0")}`, label: "" }));
+    models.push({ id: "clawrouter/gpt-5.6-luna-200k", label: "" }, { id: "clawrouter/gpt-5.6-sol-200k", label: "" });
+    const message = formatPiModelUnavailableMessage("clawrouter/gpt-5.6-luna", models);
+    expect(message).toContain("Did you mean: clawrouter/gpt-5.6-luna-200k");
+    expect(message).toContain("Available models (22):");
+    for (const entry of models) expect(message).toContain(entry.id);
+    expect(message).not.toContain("...");
+  });
+
+  it("finds a model under another provider prefix and ignores unrelated ids", () => {
+    const models = [
+      { id: "clawrouter/gpt-5.6-sol-200k", label: "" },
+      { id: "bridge/claude-opus-4-8", label: "" },
+    ];
+    expect(findClosePiModelMatches("openai/gpt-5.6-sol-200k", models)).toEqual(["clawrouter/gpt-5.6-sol-200k"]);
+    expect(findClosePiModelMatches("zzz/qqqq", models)).toEqual([]);
+  });
+
+  it("validates a model for persistence against the discovered catalog", async () => {
+    vi.spyOn(serverUtils, "runChildProcess").mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "provider  model\nclawrouter  gpt-5.6-luna-200k\n",
+      stderr: "",
+      pid: null,
+      startedAt: new Date().toISOString(),
+    });
+    const env = { PI_CODING_AGENT_DIR: "/nonexistent-pi-agent-dir" };
+    await expect(
+      validatePiModelForPersistence({ model: "clawrouter/gpt-5.6-luna-200k", command: "pi", cwd: "/tmp", env }),
+    ).resolves.toEqual({ status: "valid" });
+    const invalid = await validatePiModelForPersistence({ model: "clawrouter/gpt-5.6-luna", command: "pi", cwd: "/tmp", env });
+    expect(invalid.status).toBe("invalid");
+    expect(invalid.status === "invalid" && invalid.message).toContain("Did you mean: clawrouter/gpt-5.6-luna-200k");
+  });
+
+  it("accepts a model listed only in the agent-config models.json without spawning pi", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "pi-persist-"));
+    try {
+      await writeFile(
+        path.join(dir, "models.json"),
+        JSON.stringify({ providers: { clawrouter: { models: [{ id: "gpt-5.6-sol-200k" }] } } }),
+      );
+      const run = vi.spyOn(serverUtils, "runChildProcess");
+      await expect(
+        validatePiModelForPersistence({ model: "clawrouter/gpt-5.6-sol-200k", env: { PI_CODING_AGENT_DIR: dir } }),
+      ).resolves.toEqual({ status: "valid" });
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails open as unverified when the catalog cannot be read", async () => {
+    vi.spyOn(serverUtils, "runChildProcess").mockResolvedValue({
+      exitCode: null,
+      signal: "SIGTERM",
+      timedOut: true,
+      stdout: "",
+      stderr: "",
+      pid: null,
+      startedAt: new Date().toISOString(),
+    });
+    const result = await validatePiModelForPersistence({
+      model: "clawrouter/anything",
+      command: "pi",
+      cwd: "/tmp",
+      env: { PI_CODING_AGENT_DIR: "/nonexistent-pi-agent-dir" },
+    });
+    expect(result.status).toBe("unverified");
   });
 });

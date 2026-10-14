@@ -47,7 +47,6 @@ import {
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
   DEFAULT_MODEL,
-  VALID_PROVIDERS,
 } from "../shared/constants.js";
 
 import {

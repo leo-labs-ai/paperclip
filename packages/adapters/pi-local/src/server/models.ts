@@ -372,13 +372,119 @@ export async function ensurePiModelConfiguredAndAvailable(input: {
   }
 
   if (!models.some((entry) => entry.id === model)) {
-    const sample = models.slice(0, 12).map((entry) => entry.id).join(", ");
-    throw new Error(
-      `Configured Pi model is unavailable: ${model}. Available models: ${sample}${models.length > 12 ? ", ..." : ""}`,
-    );
+    throw new Error(formatPiModelUnavailableMessage(model, models));
   }
 
   return models;
+}
+
+const CLOSE_MATCH_LIMIT = 5;
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i += 1) {
+    const curr = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(curr[j - 1]! + 1, prev[j]! + 1, prev[j - 1]! + cost);
+    }
+    prev = curr;
+  }
+  return prev[b.length]!;
+}
+
+function bareModelName(id: string): string {
+  const slash = id.indexOf("/");
+  return (slash >= 0 ? id.slice(slash + 1) : id).toLowerCase();
+}
+
+/**
+ * Rank available model ids by similarity to `model`. Matches on the bare model
+ * name (provider prefix stripped) so `clawrouter/gpt-5.6-luna` suggests
+ * `clawrouter/gpt-5.6-luna-200k`, and a wrong provider prefix still finds the
+ * right model under another provider.
+ */
+export function findClosePiModelMatches(
+  model: string,
+  models: AdapterModel[],
+  limit = CLOSE_MATCH_LIMIT,
+): string[] {
+  const target = bareModelName(model);
+  if (!target) return [];
+  const threshold = Math.max(2, Math.floor(target.length / 3));
+  const scored: Array<{ id: string; score: number }> = [];
+  for (const entry of models) {
+    const candidate = bareModelName(entry.id);
+    let score: number;
+    if (candidate === target) score = 0;
+    else if (candidate.includes(target) || target.includes(candidate)) score = 1;
+    else {
+      const distance = levenshtein(target, candidate);
+      if (distance > threshold) continue;
+      score = 1 + distance;
+    }
+    scored.push({ id: entry.id, score });
+  }
+  scored.sort((a, b) => a.score - b.score || a.id.localeCompare(b.id));
+  return scored.slice(0, limit).map((entry) => entry.id);
+}
+
+/**
+ * Error text for a model that Pi (and therefore ClawRouter) cannot resolve.
+ * Lists close matches first, then every available model; the old message
+ * showed only the first 12 ids alphabetically, which usually hid the model the
+ * operator meant.
+ */
+export function formatPiModelUnavailableMessage(model: string, models: AdapterModel[]): string {
+  const ids = models.map((entry) => entry.id);
+  const close = findClosePiModelMatches(model, models);
+  const parts = [`Configured Pi model is unavailable: ${model}.`];
+  if (close.length > 0) parts.push(`Did you mean: ${close.join(", ")}?`);
+  parts.push(`Available models (${ids.length}): ${ids.join(", ")}`);
+  return parts.join(" ");
+}
+
+export type PiModelPersistenceValidation =
+  | { status: "valid" }
+  | { status: "invalid"; message: string }
+  | { status: "unverified"; reason: string };
+
+/**
+ * Save-time check used when an agent is created or its model changes. Uses the
+ * same sources as the run preflight (agent-config models.json, then
+ * `pi --list-models`, which reflects ClawRouter's catalog).
+ *
+ * Fail-open: when the catalog cannot be read (discovery errors, times out, or
+ * returns nothing) the result is `unverified` and callers should save with a
+ * warning instead of blocking agent edits on a ClawRouter/Pi outage. The run
+ * preflight still rejects a bad model with the full error later.
+ */
+export async function validatePiModelForPersistence(input: {
+  model?: unknown;
+  command?: unknown;
+  cwd?: unknown;
+  env?: unknown;
+}): Promise<PiModelPersistenceValidation> {
+  const model = asString(input.model, "").trim();
+  if (!model) return { status: "unverified", reason: "no model configured" };
+
+  const fileEnv = normalizeEnv({ ...process.env, ...normalizeEnv(input.env) });
+  const fileModels = await readPiModelsFromAgentConfig(fileEnv);
+  if (fileModels?.some((entry) => entry.id === model)) return { status: "valid" };
+
+  let models: AdapterModel[];
+  try {
+    models = await discoverPiModelsCached({ command: input.command, cwd: input.cwd, env: input.env });
+  } catch (error) {
+    return { status: "unverified", reason: error instanceof Error ? error.message : String(error) };
+  }
+  const merged = sortModels(dedupeModels([...(fileModels ?? []), ...models]));
+  if (merged.length === 0) return { status: "unverified", reason: "Pi returned no models" };
+  if (merged.some((entry) => entry.id === model)) return { status: "valid" };
+  return { status: "invalid", message: formatPiModelUnavailableMessage(model, merged) };
 }
 
 export async function listPiModels(): Promise<AdapterModel[]> {
