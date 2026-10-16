@@ -116,6 +116,7 @@ class FakeRuntime {
     mode: "persistent" | "oneshot";
     cwd?: string;
     resumeSessionId?: string;
+    sessionOptions?: { env: Record<string, string> };
   }> = [];
   startInputs: Array<{ handle: FakeRuntimeHandle; text: string; requestId: string; timeoutMs?: number }> = [];
   closeInputs: Array<{ handle: FakeRuntimeHandle; reason: string; discardPersistentState?: boolean }> = [];
@@ -136,6 +137,7 @@ class FakeRuntime {
     mode: "persistent" | "oneshot";
     cwd?: string;
     resumeSessionId?: string;
+    sessionOptions?: { env: Record<string, string> };
   }): Promise<FakeRuntimeHandle> {
     this.ensureInputs.push(input);
     this.ensureCount += 1;
@@ -519,6 +521,70 @@ describe("claude_local ACP lane", () => {
         level: "info",
       }),
     );
+  });
+
+  it("rejects missing trusted routing before ACP launch and environment probing", async () => {
+    const previous = process.env.PAPERCLIP_CLAWROUTER_BASE_URL;
+    delete process.env.PAPERCLIP_CLAWROUTER_BASE_URL;
+    try {
+      const config = { model: "clawrouter/claude-sonnet-5-200k", env: { PAPERCLIP_CLAWROUTER_BASE_URL: "https://attacker.invalid" } };
+      const executor = createClaudeAcpExecutor({ createRuntime: () => { throw new Error("must not launch"); } });
+      const result = await executor(buildContext("/unused", { config }));
+      expect(result.errorCode).toBe("claude_clawrouter_configuration_invalid");
+      const probe = await testClaudeAcpEnvironment({ companyId: "test-company", adapterType: "claude_local", config });
+      expect(probe.status).toBe("fail");
+      expect(probe.checks).toHaveLength(1);
+      expect(probe.checks[0]?.code).toBe("claude_clawrouter_configuration_invalid");
+    } finally {
+      if (previous !== undefined) process.env.PAPERCLIP_CLAWROUTER_BASE_URL = previous;
+    }
+  });
+
+  it("routes an explicit ClawRouter model through the actual ACP launch boundary without logging its key", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-route-");
+    const previousUrl = process.env.PAPERCLIP_CLAWROUTER_BASE_URL;
+    const previousKey = process.env.CLAWROUTER_PROXY_KEY;
+    process.env.PAPERCLIP_CLAWROUTER_BASE_URL = "http://router.internal:8789";
+    process.env.CLAWROUTER_PROXY_KEY = "synthetic-acp-route-secret";
+    try {
+      const runtimes: FakeRuntime[] = [];
+      const metadata: AdapterInvocationMeta[] = [];
+      const logs: string[] = [];
+      const executor = createClaudeAcpExecutor({
+        createRuntime: (options: FakeRuntimeOptions) => {
+          const runtime = new FakeRuntime(options);
+          runtimes.push(runtime);
+          return runtime as never;
+        },
+      });
+      const config = {
+        engine: "acp", cwd: root, stateDir: path.join(root, "state"), mode: "oneshot",
+        model: "clawrouter/claude-sonnet-5-200k", promptTemplate: "Read the synthetic fixture.",
+        env: { ANTHROPIC_BASE_URL: "https://attacker.invalid", ANTHROPIC_API_KEY: "competing-key" },
+      };
+      const before = structuredClone(config);
+      const result = await executor(buildContext(root, {
+        config,
+        onMeta: async (payload: AdapterInvocationMeta) => { metadata.push(payload); },
+        onLog: async (_stream: string, text: string) => { logs.push(text); },
+      }));
+      expect(result.exitCode).toBe(0);
+      expect(config).toEqual(before);
+      expect(runtimes[0]?.ensureInputs[0]?.sessionOptions).toMatchObject({ env: {
+        ANTHROPIC_BASE_URL: "http://router.internal:8789", ANTHROPIC_AUTH_TOKEN: "synthetic-acp-route-secret",
+        CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1", CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1",
+        ANTHROPIC_API_KEY: "", ANTHROPIC_MODEL: "claude-sonnet-5-200k",
+      } });
+      expect(JSON.stringify(result)).not.toContain("synthetic-acp-route-secret");
+      expect(JSON.stringify(metadata)).not.toContain("synthetic-acp-route-secret");
+      expect(logs.join("\n")).not.toContain("synthetic-acp-route-secret");
+      expect(JSON.stringify(metadata.map((entry) => entry.commandArgs))).not.toContain("synthetic-acp-route-secret");
+    } finally {
+      if (previousUrl === undefined) delete process.env.PAPERCLIP_CLAWROUTER_BASE_URL;
+      else process.env.PAPERCLIP_CLAWROUTER_BASE_URL = previousUrl;
+      if (previousKey === undefined) delete process.env.CLAWROUTER_PROXY_KEY;
+      else process.env.CLAWROUTER_PROXY_KEY = previousKey;
+    }
   });
 
   it("executes through ACPX with Claude model env, settings.local.json, and ephemeral skills", async () => {
