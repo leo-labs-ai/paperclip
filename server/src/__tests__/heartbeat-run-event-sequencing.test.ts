@@ -76,6 +76,44 @@ describe("P6-11..13 / P6-17 canonical event allocator", () => {
     }
   }, 60_000);
 
+  it("repairs a trailing counter across concurrent fenced writers without rewriting evidence", async () => {
+    const temporary = await startEmbeddedPostgresTestDatabase("paperclip-drift-events-");
+    const db = createDb(temporary.connectionString);
+    const otherDb = createDb(temporary.connectionString);
+    const companyId = "20000000-0000-4000-8000-000000000001";
+    const agentId = "20000000-0000-4000-8000-000000000002";
+    const runId = "20000000-0000-4000-8000-000000000003";
+    const claim = { ownerToken: "current-owner", fence: 7 };
+    const event = { companyId, agentId, runId, eventType: "lifecycle", claim };
+    try {
+      await db.insert(companies).values({ id: companyId, name: "Drift fixture", issuePrefix: "DRF" });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Drift agent" });
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", ...claim });
+      const [original] = await db.insert(heartbeatRunEvents).values({
+        companyId, agentId, runId, seq: 1, eventType: "stdout", payload: { evidence: "immutable" },
+      }).returning();
+      await expect(appendHeartbeatRunEvent(db, {
+        ...event, companyId: "20000000-0000-4000-8000-000000000099",
+      })).rejects.toThrow("heartbeat_run_event_binding_mismatch");
+      await expect(appendHeartbeatRunEvent(db, {
+        ...event, agentId: "20000000-0000-4000-8000-000000000099",
+      })).rejects.toThrow("heartbeat_run_event_binding_mismatch");
+      expect((await appendHeartbeatRunEvent(db, {
+        ...event, claim: { ...claim, fence: 6 },
+      })).disposition).toBe("rejected");
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.nextEventSeq).toBe(1);
+      const receipts = await Promise.all([db, otherDb].map(connection => appendHeartbeatRunEvent(connection, event)));
+      expect(receipts.map(receipt => receipt.row.seq).sort()).toEqual([2, 3]);
+      expect(receipts.every(receipt => receipt.row.fence === claim.fence)).toBe(true);
+      expect((await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.id, original!.id)))[0]).toEqual(original);
+      // A reserved sequence can be ahead of retained evidence and must not regress.
+      await db.update(heartbeatRuns).set({ nextEventSeq: 10 }).where(eq(heartbeatRuns.id, runId));
+      expect((await appendHeartbeatRunEvent(db, event)).row.seq).toBe(10);
+    } finally {
+      await temporary.cleanup();
+    }
+  }, 60_000);
+
   it("serializes concurrent writers and rejects conflicting replay without cursor drift", async () => {
     const temporary = await startEmbeddedPostgresTestDatabase("paperclip-native-events-");
     const db = createDb(temporary.connectionString);
