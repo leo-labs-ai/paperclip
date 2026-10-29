@@ -1,7 +1,7 @@
-# Fork Notes — lue-labs/paperclip
+# Fork Notes — leo-labs-ai/paperclip
 
 This is a customized fork of [`paperclipai/paperclip`](https://github.com/paperclipai/paperclip).
-`origin` = `lue-labs/paperclip`; `upstream` = `paperclipai/paperclip` (push-disabled).
+`origin` = `leo-labs-ai/paperclip` (renamed from `lue-labs`); `upstream` = `paperclipai/paperclip` (push-disabled).
 Default branch: **`master`**.
 
 Read this before syncing upstream so fork customizations aren't silently clobbered
@@ -10,7 +10,7 @@ or upstream-only machinery re-enabled.
 ## Deploy chain
 
 ```
-push to master  →  .github/workflows/docker.yml  →  ghcr.io/lue-labs/paperclip:sha-<short>
+push to master  →  .github/workflows/docker.yml  →  ghcr.io/leo-labs-ai/paperclip:sha-<short>
                 →  infra/lue-kube/k3s/apps/paperclip/base/app.yaml (image ref)
                 →  Flux (kustomization apps-paperclip-prod)  →  lue-kube
 ```
