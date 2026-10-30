@@ -9542,6 +9542,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .where(eq(issueComments.companyId, fixture.companyId))
       .then((rows) => rows.length);
     const wakeupCountBefore = owner.wakeup.mock.calls.length;
+    // The owner's 200ms local lease has normally lapsed by now, so each stale
+    // callback reclaims it before its ownership check. A host stall longer than
+    // the TTL between that renewal and the check would drop the callback before
+    // its admission barrier and leave this test waiting forever. Freeze only the
+    // wall clock until both callbacks are parked; the real wait below still
+    // expires the lease for the standby takeover.
+    const admissionClock = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(admissionClock));
     holdOldCallbacks = true;
     const staleMessage = deliverMessage({
       callbacks: staleCallbacks,
@@ -9552,7 +9561,33 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       trigger: "subscribed_message",
     });
     const staleReaction = staleCallbacks.onReaction(reaction);
-    await Promise.all([messageAdmissionReached, reactionAdmissionReached]);
+    // A callback that returns before its barrier never settles that barrier;
+    // fail fast instead so the finally always restores the real clock.
+    const admittedBeforeReturn = (
+      admission: Promise<void>,
+      callback: Promise<unknown>,
+      label: string,
+    ) =>
+      Promise.race([
+        admission,
+        callback.then(() => {
+          throw new Error(
+            `Stale ${label} callback returned before its admission barrier`,
+          );
+        }),
+      ]);
+    try {
+      await Promise.all([
+        admittedBeforeReturn(messageAdmissionReached, staleMessage, "message"),
+        admittedBeforeReturn(
+          reactionAdmissionReached,
+          staleReaction,
+          "reaction",
+        ),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
 
     const standbyRuntime = new FakeChatSdkRuntime();
     const standby = createService(standbyRuntime, providerFetch);
