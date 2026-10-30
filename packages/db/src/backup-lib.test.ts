@@ -490,7 +490,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
       const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
       const originalPsqlPath = process.env.PAPERCLIP_PSQL_PATH;
-      process.env.PAPERCLIP_PG_DUMP_PATH = "/bin/false";
+      process.env.PAPERCLIP_PG_DUMP_PATH = path.join(backupDir, "missing-pg-dump");
       process.env.PAPERCLIP_PSQL_PATH = "/bin/false";
 
       try {
@@ -522,6 +522,8 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
           backupEngine: "auto",
         });
 
+        expect(fs.readdirSync(backupDir)).toEqual([path.basename(result.backupFile)]);
+        expect(fs.statSync(result.backupFile).mode & 0o777).toBe(0o600);
         const backupSql = gunzipSync(await fs.promises.readFile(result.backupFile)).toString("utf8");
         expect(backupSql.indexOf("-- Data for: public.aaa_child_records")).toBeGreaterThan(-1);
         expect(backupSql.indexOf("-- Data for: public.aaa_child_records")).toBeLessThan(
