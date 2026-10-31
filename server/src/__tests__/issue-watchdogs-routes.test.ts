@@ -243,7 +243,7 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     }
   }
 
-  it("recovers a newly observed stopped state once with its status and comment committed together", async () => {
+  it.each([false, true])("recovers a newly observed stopped state once (previously reviewed: %s)", async (previouslyReviewed) => {
     const companyId = await seedCompany();
     const watchdogAgentId = await seedAgent(companyId);
     const watchedIssueId = await seedIssue(companyId);
@@ -259,6 +259,11 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
       type: "agent", agentId: watchdogAgentId, companyId, runId, source: "agent_jwt",
     });
 
+    if (previouslyReviewed) {
+      await db.update(issueWatchdogs).set({
+        lastReviewedFingerprint: sql`${issueWatchdogs.lastObservedFingerprint}`,
+      }).where(eq(issueWatchdogs.issueId, watchedIssueId));
+    }
     await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, watchedIssueId));
     const stale = await request(app).patch(`/api/issues/${watchedIssueId}`)
       .send({ status: "todo", comment: "Restore the next action." });

@@ -533,6 +533,7 @@ function applyCreateIssueStatusDefault(
 
 function noopTaskWatchdogService(): TaskWatchdogService {
   return {
+    inspectForIssue: async () => null,
     getActiveForIssue: async () => null,
     listActiveSummariesForIssues: async () => new Map(),
     upsertForIssue: async () => {

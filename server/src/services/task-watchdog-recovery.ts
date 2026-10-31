@@ -138,7 +138,7 @@ export async function applyTaskWatchdogRecovery<T>(
           status: leaf.issueId === issue.id ? null : leaf.status,
         }));
       if (
-        after?.state !== "stopped" ||
+        (after?.state !== "stopped" && after?.state !== "already_reviewed") ||
         !isDeepStrictEqual(before.includedIssueIds, after.includedIssueIds) ||
         !isDeepStrictEqual(unchangedLeaves(before.stopSnapshot.materialLeaves), unchangedLeaves(after.stopSnapshot.materialLeaves)) ||
         !isDeepStrictEqual(before.stopSnapshot.waitsByIssueId, after.stopSnapshot.waitsByIssueId)
