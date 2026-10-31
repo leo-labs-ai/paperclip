@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -30,6 +30,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { taskWatchdogService } from "../services/task-watchdogs.js";
+import { applyTaskWatchdogRecovery } from "../services/task-watchdog-recovery.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -242,6 +243,138 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     }
   }
 
+  it("recovers a newly observed stopped state once with its status and comment committed together", async () => {
+    const companyId = await seedCompany();
+    const watchdogAgentId = await seedAgent(companyId);
+    const watchedIssueId = await seedIssue(companyId);
+    const watchdogIssueId = await seedIssue(companyId, {
+      originKind: "task_watchdog",
+      originId: watchedIssueId,
+      assigneeAgentId: watchdogAgentId,
+    });
+    const runId = await seedWatchdogRun({
+      companyId, watchdogAgentId, watchedIssueId, watchdogIssueId,
+    });
+    const app = createApp(companyId, {
+      type: "agent", agentId: watchdogAgentId, companyId, runId, source: "agent_jwt",
+    });
+
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, watchedIssueId));
+    const stale = await request(app).patch(`/api/issues/${watchedIssueId}`)
+      .send({ status: "todo", comment: "Restore the next action." });
+    expect(stale.status, JSON.stringify(stale.body)).toBe(409);
+
+    const observed = await request(app).get(`/api/issues/${watchedIssueId}/watchdog`);
+    expect(observed.status, JSON.stringify(observed.body)).toBe(200);
+    expect(observed.body.currentState).toBe("stopped");
+    expect(observed.body.currentStopFingerprint).toMatch(/^task_watchdog_stop:[a-f0-9]+$/);
+    const [wakeRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const wakeContext = wakeRun.contextSnapshot?.taskWatchdog as { stopFingerprint: string };
+    const staleRecovery = await request(app).patch(`/api/issues/${watchedIssueId}`).send({
+      status: "todo",
+      comment: "This stale batch must not commit.",
+      watchdogRecovery: { observedStopFingerprint: wakeContext.stopFingerprint },
+    });
+    expect(staleRecovery.status, JSON.stringify(staleRecovery.body)).toBe(409);
+    const outsideIssueId = await seedIssue(companyId, { title: "Unrelated work" });
+    const outsideRecovery = await request(app).patch(`/api/issues/${outsideIssueId}`).send({
+      comment: "This batch is outside the watched subtree.",
+      watchdogRecovery: { observedStopFingerprint: observed.body.currentStopFingerprint },
+    });
+    expect(outsideRecovery.status, JSON.stringify(outsideRecovery.body)).toBe(403);
+    const expandedRecovery = await request(app).patch(`/api/issues/${watchedIssueId}`).send({
+      title: "An unauthorized extra mutation",
+      comment: "This batch exceeds the recovery field boundary.",
+      watchdogRecovery: { observedStopFingerprint: observed.body.currentStopFingerprint },
+    });
+    expect(expandedRecovery.status, JSON.stringify(expandedRecovery.body)).toBe(400);
+    const recovered = await request(app).patch(`/api/issues/${watchedIssueId}`).send({
+      status: "todo",
+      comment: "Restore the next action.",
+      watchdogRecovery: { observedStopFingerprint: observed.body.currentStopFingerprint },
+    });
+    expect(recovered.status, JSON.stringify(recovered.body)).toBe(200);
+    expect(recovered.body.status).toBe("todo");
+    const comments = await db.select().from(issueComments)
+      .where(eq(issueComments.issueId, watchedIssueId));
+    expect(comments.map((comment) => comment.body)).toEqual(["Restore the next action."]);
+
+    // Heartbeat updates may replace context from the original wake snapshot.
+    await db.update(heartbeatRuns).set({ contextSnapshot: wakeRun.contextSnapshot })
+      .where(eq(heartbeatRuns.id, runId));
+    const nextObservation = await request(app).get(`/api/issues/${watchedIssueId}/watchdog`);
+    const replay = await request(app).patch(`/api/issues/${watchedIssueId}`).send({
+      comment: "A second recovery is not allowed.",
+      watchdogRecovery: { observedStopFingerprint: nextObservation.body.currentStopFingerprint },
+    });
+    expect(replay.status, JSON.stringify(replay.body)).toBe(409);
+    const persisted = await db.select().from(issueComments)
+      .where(eq(issueComments.issueId, watchedIssueId));
+    expect(persisted.map((comment) => comment.body)).toEqual(["Restore the next action."]);
+  });
+
+  it.each(["comment constraint", "concurrent live run", "authorization change"] as const)(
+    "rolls back status, comment and recovery receipt after a %s",
+    async (failure) => {
+      const companyId = await seedCompany();
+      const watchdogAgentId = await seedAgent(companyId);
+      const watchedIssueId = await seedIssue(companyId, { status: "in_review" });
+      const watchdogIssueId = await seedIssue(companyId, {
+        originKind: "task_watchdog", originId: watchedIssueId, assigneeAgentId: watchdogAgentId,
+      });
+      const runId = await seedWatchdogRun({
+        companyId, watchdogAgentId, watchedIssueId, watchdogIssueId,
+      });
+      const observed = await taskWatchdogService(db).inspectForIssue(companyId, watchedIssueId);
+      const [before] = await db.select().from(issues).where(eq(issues.id, watchedIssueId));
+      if (failure === "authorization change") {
+        await db.update(issues).set({ reviewPolicy: "creator" }).where(eq(issues.id, watchedIssueId));
+      }
+      const result = await applyTaskWatchdogRecovery(db, {
+        actor: { type: "agent", agentId: watchdogAgentId, companyId, runId },
+        issueId: watchedIssueId,
+        observedStopFingerprint: observed!.currentStopFingerprint!,
+        expectedIssue: before,
+        mutations: ["status", "comment"],
+      }, async (tx) => {
+        await tx.update(issues).set({ status: "todo" }).where(eq(issues.id, watchedIssueId));
+        await tx.insert(issueComments).values({
+          companyId, issueId: watchedIssueId, authorAgentId: watchdogAgentId,
+          body: failure === "comment constraint" ? sql`NULL` : "Restore the next action.",
+        });
+        // A different connection commits the live path while recovery is still open.
+        await db.insert(heartbeatRuns).values({
+          companyId, agentId: watchdogAgentId, status: "running",
+          contextSnapshot: { issueId: watchedIssueId },
+        });
+      }, []).then(() => null, (error: unknown) => error);
+      expect(result).not.toBeNull();
+      if (failure === "comment constraint") {
+        const databaseError = result as { code?: string; cause?: { code?: string } };
+        expect(databaseError.cause?.code ?? databaseError.code).toBe("23502");
+      } else {
+        expect(result).toMatchObject({
+          status: 409, details: { code: "task_watchdog_recovery_stale" },
+        });
+        const evidence = await db.select().from(activityLog).where(and(
+          eq(activityLog.entityId, watchdogIssueId),
+          eq(activityLog.action, "issue.task_watchdog_recovery_stale"),
+        ));
+        expect(evidence).toHaveLength(1);
+        expect(evidence[0].details).toMatchObject({ sourceIssueId: watchedIssueId });
+      }
+      const [after] = await db.select().from(issues).where(eq(issues.id, watchedIssueId));
+      expect(after.status).toBe("in_review");
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, watchedIssueId));
+      expect(comments).toEqual([]);
+      const receipts = await db.select().from(activityLog).where(and(
+        eq(activityLog.runId, runId),
+        eq(activityLog.action, "issue.task_watchdog_recovery_applied"),
+      ));
+      expect(receipts).toEqual([]);
+    },
+  );
+
   it("creates, updates, reads, lists, and removes an issue watchdog with activity logs", async () => {
     const companyId = await seedCompany();
     const issueId = await seedIssue(companyId, { identifier: "WDOG-1", issueNumber: 1 });
@@ -309,7 +442,8 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     const actions = await db
       .select({ action: activityLog.action })
       .from(activityLog)
-      .where(eq(activityLog.entityId, issueId));
+      .where(eq(activityLog.entityId, issueId))
+      .orderBy(activityLog.createdAt, activityLog.id);
     const actionNames = actions.map((row) => row.action);
     expect(actionNames.filter((action) => action.startsWith("issue.watchdog_"))).toEqual([
       "issue.watchdog_created",

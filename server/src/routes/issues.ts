@@ -213,6 +213,10 @@ import type {
   TaskWatchdogServiceDeps,
   taskWatchdogService,
 } from "../services/task-watchdogs.js";
+import {
+  applyTaskWatchdogRecovery,
+  recordTaskWatchdogRecoveryStale,
+} from "../services/task-watchdog-recovery.js";
 import { logger } from "../middleware/logger.js";
 import {
   badRequest,
@@ -5281,7 +5285,7 @@ export function issueRoutes(
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
     },
-    options: { allowVisibleIssueWrite?: boolean } = {},
+    options: { allowVisibleIssueWrite?: boolean; observedStopFingerprint?: string } = {},
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -5318,7 +5322,16 @@ export function issueRoutes(
         });
         return false;
       }
-      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
+      return assertFreshTaskWatchdogSourceMutation(
+        res,
+        watchdogScope.kind === "watchdog" && options.observedStopFingerprint
+          ? { ...watchdogScope, stopFingerprint: options.observedStopFingerprint }
+          : watchdogScope,
+        issue,
+        options.observedStopFingerprint
+          ? { agentId: actorAgentId, runId: req.actor.runId! }
+          : undefined,
+      );
     }
     const boundaryDecision = await decideIssueAccess(
       req,
@@ -5418,6 +5431,7 @@ export function issueRoutes(
     res: Response,
     scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
     issue: { id: string },
+    recoveryActor?: { agentId: string; runId: string },
   ) {
     if (scope.kind !== "watchdog") return true;
     if (scope.watchdogIssueId && issue.id === scope.watchdogIssueId)
@@ -5425,6 +5439,11 @@ export function issueRoutes(
 
     const revalidated = await taskWatchdogsSvc.revalidateMutationScope(scope);
     if (revalidated.allowed) return true;
+    if (recoveryActor && scope.stopFingerprint) {
+      await recordTaskWatchdogRecoveryStale(
+        db, recoveryActor, scope, scope.stopFingerprint, revalidated.reason,
+      );
+    }
     res.status(409).json({
       error: revalidated.reason,
       details: {
@@ -8965,7 +8984,7 @@ export function issueRoutes(
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     res.json(
-      await taskWatchdogsSvc.getActiveForIssue(issue.companyId, issue.id),
+      await taskWatchdogsSvc.inspectForIssue(issue.companyId, issue.id),
     );
   });
 
@@ -12753,6 +12772,22 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!existing) return;
+      const watchdogRecovery = req.body.watchdogRecovery;
+      if (watchdogRecovery) {
+        if (
+          req.actor.type !== "agent" || !req.actor.agentId || !req.actor.runId ||
+          Object.keys(req.body).some((key) => !["status", "comment", "watchdogRecovery"].includes(key)) ||
+          (!req.body.status && !req.body.comment) ||
+          (req.body.status && !["todo", "in_progress", "in_review", "blocked"].includes(req.body.status)) ||
+          isClosedIssueStatus(existing.status)
+        ) {
+          throw badRequest("Watchdog recovery accepts a nonterminal status change and/or a comment.");
+        }
+        const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
+        if (scope.kind !== "watchdog" || scope.watchdogIssueId === existing.id) {
+          throw forbidden("Recovery requires a watchdog run targeting its watched subtree.");
+        }
+      }
       assertNoAgentHostWorkspaceCommandMutation(
         req,
         collectIssueWorkspaceCommandPaths(req.body),
@@ -12777,7 +12812,10 @@ export function issueRoutes(
         req,
         res,
         existing,
-        { allowVisibleIssueWrite: true },
+        {
+          allowVisibleIssueWrite: true,
+          observedStopFingerprint: watchdogRecovery?.observedStopFingerprint,
+        },
       );
       if (!issueMutationAccess) return;
       if (req.body.comment && !(await assertBoardCommentNotPaused(req, res, existing))) return;
@@ -12815,6 +12853,7 @@ export function issueRoutes(
         deferWakeForGoal,
         hiddenAt: hiddenAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
+        watchdogRecovery: _watchdogRecovery,
         ...updateFields
       } = req.body;
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
@@ -13013,6 +13052,9 @@ export function issueRoutes(
       let interruptedRunId: string | null = null;
       const closedExecutionWorkspace =
         await getClosedIssueExecutionWorkspace(existing);
+      if (watchdogRecovery && closedExecutionWorkspace) {
+        throw conflict("Watchdog recovery cannot reopen an execution workspace; use the ordinary resume flow.");
+      }
       const isAgentWorkUpdate =
         req.actor.type === "agent" &&
         (Object.keys(updateFields).length > 0 ||
@@ -13179,6 +13221,15 @@ export function issueRoutes(
         };
       }
       Object.assign(updateFields, transition.patch);
+      if (watchdogRecovery && (
+        Object.keys(transition.patch).some((key) => key !== "status") ||
+        (updateFields.status !== undefined && (
+          req.body.status === undefined ||
+          !["todo", "in_progress", "in_review", "blocked"].includes(updateFields.status)
+        ))
+      )) {
+        throw conflict("Watchdog recovery cannot advance an execution workflow; use its ordinary decision flow.");
+      }
 
       const nextStatus = updateFields.status ?? existing.status;
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
@@ -13629,10 +13680,11 @@ export function issueRoutes(
         transition.decision && decisionId ? transition.decision : null;
       let attachmentComment: Awaited<ReturnType<typeof svc.addComment>> | null =
         null;
-      const attachmentCommentSourceTrust = commentAttachmentIds?.length
+      const attachmentCommentSourceTrust = commentAttachmentIds?.length || watchdogRecovery
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
+        Boolean(watchdogRecovery) ||
         Boolean(commentAttachmentIds?.length) ||
         Boolean(decision) ||
         shouldRelayStop ||
@@ -13640,7 +13692,7 @@ export function issueRoutes(
         reviewPolicySensitiveMutationRequested;
       try {
         if (shouldUseTransactionalIssueUpdate) {
-          issue = await db.transaction(async (tx) => {
+          const applyUpdate = async (tx: Parameters<Parameters<typeof db.transaction>[0]>[0]) => {
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -13648,7 +13700,7 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
-            if (commentAttachmentIds?.length) {
+            if (commentAttachmentIds?.length || (watchdogRecovery && commentBody)) {
               // Reassignment, comment creation and upload binding commit together.
               // An invalid or already-bound receipt rolls back the issue update.
               attachmentComment = await svc.addComment(
@@ -13696,7 +13748,29 @@ export function issueRoutes(
             await persistReviewTransitionActivity(tx, updated);
 
             return updated;
-          });
+          };
+          issue = watchdogRecovery
+            ? await applyTaskWatchdogRecovery(
+                db,
+                {
+                  actor: {
+                    type: "agent",
+                    agentId: req.actor.agentId!,
+                    companyId: existing.companyId,
+                    runId: req.actor.runId!,
+                  },
+                  issueId: existing.id,
+                  observedStopFingerprint: watchdogRecovery.observedStopFingerprint,
+                  expectedIssue: existing,
+                  mutations: [
+                    ...(req.body.status ? ["status" as const] : []),
+                    ...(commentBody ? ["comment" as const] : []),
+                  ],
+                },
+                applyUpdate,
+                postCommitActivityPublications,
+              )
+            : await db.transaction(applyUpdate);
         } else {
           issue = await updateIssue();
         }

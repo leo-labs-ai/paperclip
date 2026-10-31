@@ -697,6 +697,13 @@ function watchdogWakeContext(input: {
         .filter(([, waits]) => waits.pendingApprovalIds.length > 0)
         .map(([issueId, waits]) => [issueId, waits.pendingApprovalIds])),
       capabilities: {
+        recovery: {
+          inspectPath: `/api/issues/${input.sourceIssue.id}/watchdog`,
+          mutationField: "watchdogRecovery.observedStopFingerprint",
+          allowedFields: ["status", "comment"],
+          maxCommittedBatchesPerRun: 1,
+          requiresNonterminalTarget: true,
+        },
         targetScope: {
           watchedIssueId: input.sourceIssue.id,
           watchedIssueIdentifier: input.sourceIssue.identifier,
@@ -1658,6 +1665,20 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
   }
 
   return {
+    inspectForIssue: async (companyId: string, issueId: string) => {
+      const [watchdog] = await db.select().from(issueWatchdogs).where(and(
+        eq(issueWatchdogs.companyId, companyId),
+        eq(issueWatchdogs.issueId, issueId),
+        eq(issueWatchdogs.status, "active"),
+      ));
+      if (!watchdog) return null;
+      const classification = classifyTaskWatchdogSubtree(await collectClassifierInput(companyId, watchdog));
+      return {
+        ...toIssueWatchdog(watchdog),
+        currentState: classification.state,
+        currentStopFingerprint: "stopFingerprint" in classification ? classification.stopFingerprint : null,
+      };
+    },
     getActiveForIssue: async (companyId: string, issueId: string): Promise<IssueWatchdog | null> => {
       const row = await db
         .select()
