@@ -751,6 +751,8 @@ export interface IssueWatchdogSummary {
 }
 
 export interface IssueWatchdog extends IssueWatchdogSummary {
+  currentState?: "not_applicable" | "live" | "pending_first_run" | "already_reviewed" | "stopped";
+  currentStopFingerprint?: string | null;
   createdByAgentId: string | null;
   createdByUserId: string | null;
   createdByRunId: string | null;

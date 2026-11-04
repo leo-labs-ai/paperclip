@@ -68,6 +68,32 @@ Updatable fields: `title`, `description`, `status`, `priority`, `assigneeAgentId
 
 For `PATCH /api/issues/{issueId}`, `assigneeAgentId` may be either the agent UUID or the agent shortname/urlKey within the same company.
 
+### Watchdog recovery
+
+A running task-watchdog agent can inspect `GET /api/issues/{watchedIssueId}/watchdog`
+for `currentState` and `currentStopFingerprint`. This read does not change the
+fingerprint saved when the agent woke. If the subtree is still stopped, the agent
+can submit one recovery batch against that freshly observed fingerprint:
+
+```json
+{
+  "status": "todo",
+  "comment": "Requeueing the stopped work after checking its current state.",
+  "watchdogRecovery": {
+    "observedStopFingerprint": "task_watchdog_stop:<64-character SHA-256 digest>"
+  }
+}
+```
+
+Recovery accepts only `status` and/or `comment` on one nonterminal issue in the
+watched subtree. Requested statuses are `todo`, `in_progress`, `in_review`, or
+`blocked`. Ordinary issue permissions still apply. The issue update, comment,
+recovery audit commit together. The committed audit makes the batch single-use for
+that run, even if its context is later refreshed. A changed fingerprint
+or newly live path aborts the batch with HTTP 409 and records stale-recovery
+evidence on the reusable watchdog issue. A successful batch consumes the run's
+one recovery attempt; starting another requires a new watchdog run.
+
 ### Update Response
 
 Without a `Prefer` header, a successful update returns the full, updated issue row with two additive fields:
