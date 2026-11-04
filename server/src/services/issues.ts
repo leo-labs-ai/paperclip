@@ -189,6 +189,32 @@ import {
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import {
+  assertScopedHeartbeatRun,
+  isHeartbeatRunReferenceViolation,
+  lockScopedHeartbeatRun,
+  unknownRunIdError,
+  withScopedHeartbeatRun,
+} from "./heartbeat-run-scope.js";
+
+/**
+ * Test seam for the checkout writes that run only after an earlier checkout
+ * transaction has already committed. Production leaves it unset. A probe can
+ * delete or move the actor run before `adoptStaleCheckoutRun` or the stale
+ * execution adoption write.
+ */
+let beforeUnscopedCheckoutAdoption: (() => Promise<void>) | null = null;
+
+export function setBeforeUnscopedCheckoutAdoption(
+  probe: (() => Promise<void>) | null,
+) {
+  beforeUnscopedCheckoutAdoption = probe;
+}
+
+async function probeBeforeUnscopedCheckoutAdoption() {
+  if (!beforeUnscopedCheckoutAdoption) return;
+  await beforeUnscopedCheckoutAdoption();
+}
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -7375,6 +7401,7 @@ export function issueService(db: Db) {
       const lockedIssue = await tx
         .select({
           id: issues.id,
+          companyId: issues.companyId,
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
@@ -7423,6 +7450,16 @@ export function issueService(db: Db) {
       if (!stale || !actorLive) {
         return { adopted: null, latest: lockedIssue };
       }
+
+      // Id-only FOR UPDATE above does not care which company owns the row.
+      // A same-UUID delete and reinsert under another company still looks
+      // live, and the issue FK would accept it. Scope the actor run before
+      // the write; a miss rolls this transaction back.
+      await lockScopedHeartbeatRun(tx, {
+        runId: input.actorRunId,
+        companyId: lockedIssue.companyId,
+        agentId: input.actorAgentId,
+      });
 
       const now = new Date();
       const adopted = await tx
@@ -7474,6 +7511,12 @@ export function issueService(db: Db) {
     actorRunId: string;
   }) {
     return db.transaction(async (tx) => {
+      const issueCompany = await tx
+        .select({ companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!issueCompany) return null;
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
       );
@@ -7484,6 +7527,12 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status))
         return null;
+
+      await lockScopedHeartbeatRun(tx, {
+        runId: input.actorRunId,
+        companyId: issueCompany.companyId,
+        agentId: input.actorAgentId,
+      });
 
       const now = new Date();
       const adopted = await tx
@@ -11228,9 +11277,29 @@ export function issueService(db: Db) {
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
       if (!issueCompany) throw notFound("Issue not found");
+      // Assignability is a read. It stays ahead of the run check so a
+      // terminated agent is still rejected as not assignable when the supplied
+      // run id is also absent. The run check remains before any checkout write.
       await assertAssignableAgent(db, issueCompany.companyId, agentId, {
         kind: "work",
       });
+      if (checkoutRunId) {
+        await assertScopedHeartbeatRun(db, {
+          runId: checkoutRunId,
+          companyId: issueCompany.companyId,
+          agentId,
+        });
+      }
+      const writeCheckout = <T>(run: (tx: Db) => Promise<T>) =>
+        withScopedHeartbeatRun(
+          db,
+          {
+            runId: checkoutRunId,
+            companyId: issueCompany.companyId,
+            agentId,
+          },
+          run,
+        );
 
       const now = new Date();
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
@@ -11300,27 +11369,32 @@ export function issueService(db: Db) {
             eq(issues.executionRunId, checkoutRunId),
           )
         : isNull(issues.executionRunId);
-      const updated = await db
-        .update(issues)
-        .set({
-          assigneeAgentId: agentId,
-          assigneeUserId: null,
-          checkoutRunId,
-          executionRunId: checkoutRunId,
-          status: "in_progress",
-          startedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, id),
-            inArray(issues.status, expectedStatuses),
-            or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
-            executionLockCondition,
-          ),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const updated = await writeCheckout((tx) =>
+        tx
+          .update(issues)
+          .set({
+            assigneeAgentId: agentId,
+            assigneeUserId: null,
+            checkoutRunId,
+            executionRunId: checkoutRunId,
+            status: "in_progress",
+            startedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, id),
+              inArray(issues.status, expectedStatuses),
+              or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+              executionLockCondition,
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null),
+      ).catch((error: unknown) => {
+        if (isHeartbeatRunReferenceViolation(error)) throw unknownRunIdError();
+        throw error;
+      });
 
       if (updated) {
         const [enriched] = await withIssueLabels(db, [updated]);
@@ -11349,27 +11423,32 @@ export function issueService(db: Db) {
           current.executionRunId === checkoutRunId) &&
         checkoutRunId
       ) {
-        const adopted = await db
-          .update(issues)
-          .set({
-            checkoutRunId,
-            executionRunId: checkoutRunId,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(issues.id, id),
-              eq(issues.status, "in_progress"),
-              eq(issues.assigneeAgentId, agentId),
-              isNull(issues.checkoutRunId),
-              or(
-                isNull(issues.executionRunId),
-                eq(issues.executionRunId, checkoutRunId),
+        const adopted = await writeCheckout((tx) =>
+          tx
+            .update(issues)
+            .set({
+              checkoutRunId,
+              executionRunId: checkoutRunId,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(issues.id, id),
+                eq(issues.status, "in_progress"),
+                eq(issues.assigneeAgentId, agentId),
+                isNull(issues.checkoutRunId),
+                or(
+                  isNull(issues.executionRunId),
+                  eq(issues.executionRunId, checkoutRunId),
+                ),
               ),
-            ),
-          )
-          .returning()
-          .then((rows) => rows[0] ?? null);
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null),
+        ).catch((error: unknown) => {
+          if (isHeartbeatRunReferenceViolation(error)) throw unknownRunIdError();
+          throw error;
+        });
         if (adopted) return adopted;
       }
 
@@ -11380,6 +11459,7 @@ export function issueService(db: Db) {
         current.checkoutRunId &&
         current.checkoutRunId !== checkoutRunId
       ) {
+        await probeBeforeUnscopedCheckoutAdoption();
         const staleAdoption = await adoptStaleCheckoutRun({
           issueId: id,
           actorAgentId: agentId,
@@ -11407,12 +11487,14 @@ export function issueService(db: Db) {
         current.executionRunId !== checkoutRunId &&
         (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
       ) {
+        const staleExecutionRunId = current.executionRunId;
+        await probeBeforeUnscopedCheckoutAdoption();
         const stale = await isTerminalOrMissingHeartbeatRun(
-          current.executionRunId,
+          staleExecutionRunId,
         );
         if (stale) {
           const now = new Date();
-          const adoptionSet: Record<string, unknown> = {
+          const adoptionSet: Partial<typeof issues.$inferInsert> = {
             assigneeAgentId: agentId,
             checkoutRunId,
             executionRunId: checkoutRunId,
@@ -11424,22 +11506,27 @@ export function issueService(db: Db) {
           if (current.status !== "in_progress") {
             adoptionSet.startedAt = now;
           }
-          const adopted = await db
-            .update(issues)
-            .set(adoptionSet)
-            .where(
-              and(
-                eq(issues.id, id),
-                inArray(issues.status, expectedStatuses),
-                eq(issues.executionRunId, current.executionRunId),
-                or(
-                  isNull(issues.assigneeAgentId),
-                  eq(issues.assigneeAgentId, agentId),
+          const adopted = await writeCheckout((tx) =>
+            tx
+              .update(issues)
+              .set(adoptionSet)
+              .where(
+                and(
+                  eq(issues.id, id),
+                  inArray(issues.status, expectedStatuses),
+                  eq(issues.executionRunId, staleExecutionRunId),
+                  or(
+                    isNull(issues.assigneeAgentId),
+                    eq(issues.assigneeAgentId, agentId),
+                  ),
                 ),
-              ),
-            )
-            .returning()
-            .then((rows) => rows[0] ?? null);
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null),
+          ).catch((error: unknown) => {
+            if (isHeartbeatRunReferenceViolation(error)) throw unknownRunIdError();
+            throw error;
+          });
           if (adopted) {
             const [enriched] = await withIssueLabels(db, [adopted]);
             return enriched;

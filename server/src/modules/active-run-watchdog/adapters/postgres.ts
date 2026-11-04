@@ -9,9 +9,11 @@ import {
   issues,
 } from "@paperclipai/db";
 import { parseObject } from "../../../adapters/utils.js";
+import { logger } from "../../../middleware/logger.js";
 import { visibleIssueCondition } from "../../../services/issue-visibility.js";
-import { logActivity } from "../../../services/activity-log.js";
+import { logActivity, persistActivity, publishActivity } from "../../../services/activity-log.js";
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
+import { withScopedHeartbeatRun } from "../../../services/heartbeat-run-scope.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
 import {
   executeIssuePostCommitActions,
@@ -37,6 +39,20 @@ const RECOVERY_ORIGIN_KIND_VALUES = new Set<string>(Object.values(RECOVERY_ORIGI
 
 function isRecoveryOriginKind(originKind: string | null): boolean {
   return originKind !== null && RECOVERY_ORIGIN_KIND_VALUES.has(originKind);
+}
+
+function decisionActivityDetails(input: RecordDecisionInput): Record<string, unknown> {
+  return {
+    source: "recovery.record_watchdog_decision",
+    decision: input.decision,
+    evaluationIssueId: input.evaluationIssueId,
+    snoozedUntil: input.snoozedUntil?.toISOString() ?? null,
+    reason: input.reason,
+    recoveryActorType: input.actor.type,
+    createdByAgentId: input.createdByAgentId,
+    createdByUserId: input.createdByUserId,
+    createdByRunId: input.createdByRunId,
+  };
 }
 
 function issueContextId(contextSnapshot: unknown): string | null {
@@ -313,44 +329,55 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
   }
 
   async function recordDecision(companyId: string, input: RecordDecisionInput): Promise<WatchdogDecisionRecord> {
-    const [row] = await db
-      .insert(heartbeatRunWatchdogDecisions)
-      .values({
-        companyId,
-        runId: input.runId,
-        evaluationIssueId: input.evaluationIssueId,
-        decision: input.decision,
-        snoozedUntil: input.snoozedUntil,
-        reason: input.reason,
-        createdByAgentId: input.createdByAgentId,
-        createdByUserId: input.createdByUserId,
-        createdByRunId: input.createdByRunId,
-      })
-      .returning();
-
-    await logActivity(db, {
-      companyId,
-      actorType: input.actor.type === "agent" ? "agent" : "user",
-      actorId: input.actor.type === "agent"
-        ? input.actor.agentId ?? "agent"
-        : input.actor.type === "board"
-          ? input.actor.userId ?? "board"
-          : "unknown",
-      agentId: input.actor.type === "agent" ? input.actor.agentId ?? null : null,
+    // The recovery actor often does not own the watched run. Write the decision
+    // and its activity as the system inside the watched run's company lock so
+    // an ownership rejection cannot leave a committed decision behind.
+    const committed = await withScopedHeartbeatRun(db, {
       runId: input.runId,
-      action: input.decision === "snooze" ? "heartbeat.watchdog_snoozed" : "heartbeat.watchdog_decision_recorded",
-      entityType: "heartbeat_run",
-      entityId: input.runId,
-      details: {
-        source: "recovery.record_watchdog_decision",
-        decision: input.decision,
-        evaluationIssueId: input.evaluationIssueId,
-        snoozedUntil: input.snoozedUntil?.toISOString() ?? null,
-        reason: input.reason,
-      },
+      companyId,
+      agentId: null,
+    }, async (tx) => {
+      const [row] = await tx
+        .insert(heartbeatRunWatchdogDecisions)
+        .values({
+          companyId,
+          runId: input.runId,
+          evaluationIssueId: input.evaluationIssueId,
+          decision: input.decision,
+          snoozedUntil: input.snoozedUntil,
+          reason: input.reason,
+          createdByAgentId: input.createdByAgentId,
+          createdByUserId: input.createdByUserId,
+          createdByRunId: input.createdByRunId,
+        })
+        .returning();
+      if (!row) throw new Error("Watchdog decision insert returned no row");
+
+      const persisted = await persistActivity(tx, {
+        companyId,
+        actorType: "system",
+        actorId: "system",
+        runId: input.runId,
+        action: input.decision === "snooze" ? "heartbeat.watchdog_snoozed" : "heartbeat.watchdog_decision_recorded",
+        entityType: "heartbeat_run",
+        entityId: input.runId,
+        details: decisionActivityDetails(input),
+      });
+      return { row, publication: persisted.publication };
     });
 
-    return { ...row, decision: row.decision as WatchdogDecisionRecord["decision"] };
+    // Publication is not part of the write. A synchronous failure here must
+    // not look like a rejected decision, or the caller retries and inserts another row.
+    try {
+      publishActivity(committed.publication);
+    } catch (err) {
+      logger.warn(
+        { err, companyId, runId: input.runId, decisionId: committed.row.id },
+        "Watchdog decision committed; live activity publication failed",
+      );
+    }
+
+    return { ...committed.row, decision: committed.row.decision as WatchdogDecisionRecord["decision"] };
   }
 
   async function foldSourceResolvedRun(companyId: string, input: FoldSourceResolvedRunInput): Promise<FoldOutcome> {

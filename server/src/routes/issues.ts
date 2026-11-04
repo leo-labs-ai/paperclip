@@ -172,6 +172,7 @@ import {
   documentService,
   documentAnnotationService,
   logActivity,
+  persistActivity,
   publishActivity,
   projectService,
   routineService,
@@ -236,6 +237,12 @@ import {
   collectIssueWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
+import {
+  assertScopedHeartbeatRun,
+  lockScopedHeartbeatRun,
+  runBeforeScopedHeartbeatWrite,
+} from "../services/heartbeat-run-scope.js";
+import { redactActivityDetails } from "../services/activity-log.js";
 import {
   formatAttachmentSize,
   GENERIC_ATTACHMENT_CONTENT_TYPES,
@@ -12753,10 +12760,22 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!existing) return;
+      // Host-command authorization is a pure request check. It stays ahead of
+      // the run lookup so an agent key that is not allowed to set a provision
+      // or teardown command is rejected with 403 even when the run id is also
+      // missing, malformed, or deleted. Callers who may send the field still
+      // fail closed on the run check below.
       assertNoAgentHostWorkspaceCommandMutation(
         req,
         collectIssueWorkspaceCommandPaths(req.body),
       );
+      // Fail closed before mutation. A well-formed run id that is missing, in
+      // another company, or owned by another agent must not reach activity_log.
+      await assertScopedHeartbeatRun(db, {
+        runId: req.actor.runId,
+        companyId: existing.companyId,
+        agentId: req.actor.type === "agent" ? (req.actor.agentId ?? "") : null,
+      });
       if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
         await auditAgentIssueCommentAttributionSpoof({
           db,
@@ -13638,9 +13657,51 @@ export function issueRoutes(
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
         reviewPolicySensitiveMutationRequested;
+      const scopedPatchRun =
+        typeof actor.runId === "string" && actor.runId.trim().length > 0
+          ? {
+              runId: actor.runId,
+              companyId: existing.companyId,
+              agentId:
+                actor.actorType === "agent" ? (actor.agentId ?? "") : null,
+            }
+          : null;
+      const scopedIssueUpdateSlot: {
+        value: { id: string; publication: ActivityPublication } | null;
+      } = { value: null };
+      const recordScopedIssueUpdate = async (
+        tx: Parameters<typeof svc.update>[2],
+        updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>,
+      ) => {
+        const { activity, publication } = await persistActivity(tx as unknown as Db, {
+          companyId: updated.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: updated.id,
+          details: {
+            identifier: updated.identifier,
+            authorizationReason: issueMutationAuthorizationReason,
+            changes: updated.changes ?? {},
+          },
+        });
+        if (!activity?.id) {
+          throw new Error("issue update activity did not return an id");
+        }
+        scopedIssueUpdateSlot.value = { id: activity.id, publication };
+      };
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (scopedPatchRun) {
+              await runBeforeScopedHeartbeatWrite();
+              await lockScopedHeartbeatRun(tx, scopedPatchRun);
+            }
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -13693,8 +13754,18 @@ export function issueRoutes(
               );
             }
 
-            await persistReviewTransitionActivity(tx, updated);
+            if (scopedPatchRun) await recordScopedIssueUpdate(tx, updated);
+            else await persistReviewTransitionActivity(tx, updated);
 
+            return updated;
+          });
+        } else if (scopedPatchRun) {
+          issue = await db.transaction(async (tx) => {
+            await runBeforeScopedHeartbeatWrite();
+            await lockScopedHeartbeatRun(tx, scopedPatchRun);
+            const updated = await updateIssue(tx);
+            if (!updated) return null;
+            await recordScopedIssueUpdate(tx, updated);
             return updated;
           });
         } else {
@@ -13950,19 +14021,9 @@ export function issueRoutes(
           activeRecoveryAction: null,
         };
       }
-      if (!persistReviewActivityTransactionally)
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
-          action: "issue.updated",
-          entityType: "issue",
-          entityId: issue.id,
-          details: {
+      const scopedUpdate = scopedIssueUpdateSlot.value;
+      if (scopedUpdate || !persistReviewActivityTransactionally) {
+        const issueUpdatedDetails = {
             ...updateFields,
             identifier: issue.identifier,
             authorizationReason: issueMutationAuthorizationReason,
@@ -14009,8 +14070,47 @@ export function issueRoutes(
                   }
                 : null,
             ),
-          },
-        });
+        };
+        if (scopedUpdate) {
+          const redactedDetails = await redactActivityDetails(db, issueUpdatedDetails);
+          await db
+            .update(activityLog)
+            .set({ details: redactedDetails })
+            .where(
+              and(
+                eq(activityLog.id, scopedUpdate.id),
+                eq(activityLog.companyId, issue.companyId),
+              ),
+            );
+          scopedUpdate.publication.payload.details = redactedDetails;
+          if (scopedUpdate.publication.pluginEvent) {
+            scopedUpdate.publication.pluginEvent.payload = {
+              ...(redactedDetails ?? {}),
+              agentId: actor.agentId ?? null,
+              runId: actor.runId ?? null,
+              responsibleUserId:
+                typeof scopedUpdate.publication.payload.responsibleUserId === "string"
+                  ? scopedUpdate.publication.payload.responsibleUserId
+                  : null,
+            };
+          }
+          publishActivity(scopedUpdate.publication);
+        } else {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+            action: "issue.updated",
+            entityType: "issue",
+            entityId: issue.id,
+            details: issueUpdatedDetails,
+          });
+        }
+      }
 
       if (
         existing.status === "in_progress" &&
@@ -15054,6 +15154,14 @@ export function issueRoutes(
 
       const checkoutRunId = requireAgentRunId(req, res);
       if (req.actor.type === "agent" && !checkoutRunId) return;
+      // Existence and company/agent scope, before workspace reopen. The
+      // checkout write locks the same scope; this gate stops the reopen side
+      // effect. A later delete is a 422, not a 500.
+      await assertScopedHeartbeatRun(db, {
+        runId: checkoutRunId,
+        companyId: issue.companyId,
+        agentId: req.actor.type === "agent" ? (req.actor.agentId ?? "") : req.body.agentId,
+      });
 
       // Reopen the closed isolated workspace only after the run-id gate passes. A
       // rejected checkout must not rebuild and republish the workspace as active.
