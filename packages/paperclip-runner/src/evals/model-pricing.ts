@@ -1,4 +1,4 @@
-export const MODEL_PRICING_VERSION = "provider-list-prices-2026-09-07-openrouter" as const;
+export const MODEL_PRICING_VERSION = "provider-list-prices-2026-09-22-gpt6-opus55" as const;
 
 interface TokenRatesUsdPerMillion {
   input: number;
@@ -14,6 +14,15 @@ const RATES: Readonly<Record<string, TokenRatesUsdPerMillion>> = Object.freeze({
   "gpt-5.6-sol": { input: 5, cachedInput: 0.5, output: 30 },
   "gpt-5.6-terra": { input: 2, cachedInput: 0.2, output: 12 },
   "gpt-5.6-luna": { input: 0.2, cachedInput: 0.02, output: 1.2 },
+  "gpt-6-sol": { input: 2, cachedInput: 0.2, output: 10 },
+  "gpt-6-sol-200k": { input: 2, cachedInput: 0.2, output: 10 },
+  "clawrouter/gpt-6-sol-200k": { input: 2, cachedInput: 0.2, output: 10 },
+  "gpt-6-luna": { input: 0.1, cachedInput: 0.01, output: 0.5 },
+  "gpt-6-luna-200k": { input: 0.1, cachedInput: 0.01, output: 0.5 },
+  "clawrouter/gpt-6-luna-200k": { input: 0.1, cachedInput: 0.01, output: 0.5 },
+  "claude-opus-5-5": { input: 4, cachedInput: 0.2, output: 20 },
+  "claude-opus-5-5-200k": { input: 4, cachedInput: 0.2, output: 20 },
+  "clawrouter/claude-opus-5-5-200k": { input: 4, cachedInput: 0.2, output: 20 },
   // Qualified Anthropic direct profile. Actual invoice discounts are intentionally excluded.
   "claude-sonnet-5": { input: 2, cachedInput: 0.2, output: 10 },
   // Amazon Bedrock global cross-region list price for Claude Sonnet 4.6.

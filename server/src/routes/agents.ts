@@ -221,6 +221,7 @@ import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_KIMI_LOCAL_MODEL } from "@paperclipai/adapter-kimi-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
 import { requireOpenCodeModelId } from "@paperclipai/adapter-opencode-local/server";
+import { validatePiModelForPersistence } from "@paperclipai/adapter-pi-local/server";
 import {
   loadDefaultAgentInstructionsBundle,
   resolveDefaultAgentInstructionsBundleRole,
@@ -2481,6 +2482,8 @@ export function agentRoutes(
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
+    /** Saved config of the same adapter type; an unchanged model is not re-validated. */
+    previousAdapterConfig?: Record<string, unknown> | null;
   }): Promise<Record<string, unknown>> {
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       input.companyId,
@@ -2496,6 +2499,7 @@ export function agentRoutes(
       input.constraintAdapterConfig
         ? { ...input.constraintAdapterConfig, ...normalizedAdapterConfig }
         : normalizedAdapterConfig,
+      { previousModel: input.previousAdapterConfig?.model },
     );
     return normalizePaperclipRunnerAdapterConfig(
       input.adapterType ?? "",
@@ -2674,9 +2678,14 @@ export function agentRoutes(
     companyId: string,
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
+    options: { previousModel?: unknown } = {},
   ) {
     if (adapterType === "paperclip_runner") {
       await assertFreshPaperclipRunnerProvider(companyId, adapterType, adapterConfig);
+      return;
+    }
+    if (adapterType === "pi_local") {
+      await assertPiModelResolvable(adapterConfig, options.previousModel);
       return;
     }
     if (adapterType !== "opencode_local") return;
@@ -2685,6 +2694,30 @@ export function agentRoutes(
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       throw unprocessable(`Invalid opencode_local adapterConfig: ${reason}`);
+    }
+  }
+
+  /**
+   * Reject pi_local models that Pi/ClawRouter cannot resolve, so a typo is
+   * caught at save time instead of failing every run. Skipped when the model is
+   * unchanged (existing agents stay editable). Fail-open when the catalog is
+   * unreachable: the run preflight still catches a bad model.
+   */
+  async function assertPiModelResolvable(adapterConfig: Record<string, unknown>, previousModel: unknown) {
+    const model = asNonEmptyString(adapterConfig.model);
+    if (!model) return;
+    if (typeof previousModel === "string" && previousModel.trim() === model) return;
+    const result = await validatePiModelForPersistence({
+      model,
+      command: adapterConfig.command,
+      cwd: adapterConfig.cwd,
+      env: adapterConfig.env,
+    });
+    if (result.status === "invalid") {
+      throw unprocessable(`Invalid pi_local adapterConfig: ${result.message}`);
+    }
+    if (result.status === "unverified") {
+      logger.warn({ model, reason: result.reason }, "pi_local model could not be verified at save time; allowing");
     }
   }
 
@@ -5407,6 +5440,7 @@ export function agentRoutes(
         companyId: existing.companyId,
         adapterType: requestedAdapterType,
         adapterConfig: effectiveAdapterConfig,
+        previousAdapterConfig: changingAdapterType ? null : existingAdapterConfig,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
       assertExternalInstructionsAdmin(req, {

@@ -67,6 +67,58 @@ export const CLAWROUTER_GPT_5_6_TERRA_PRICING: Readonly<{
   },
 };
 
+export const CLAWROUTER_GPT_6_SOL_PRICING: Readonly<{
+  pricingRef: string;
+  effectiveAt: string;
+  sources: readonly string[];
+  rates: ModelRates;
+}> = {
+  pricingRef: "openai-gpt-6-sol-standard-2026-09-22",
+  effectiveAt: "2026-09-22",
+  sources: ["https://developers.openai.com/api/docs/models/gpt-6-sol"],
+  rates: {
+    inputMicrosPerMillion: 2_000_000,
+    cachedInputMicrosPerMillion: 200_000,
+    outputMicrosPerMillion: 10_000_000,
+    cacheWriteMultiplier: 1.25,
+  },
+};
+
+export const CLAWROUTER_GPT_6_LUNA_PRICING: Readonly<{
+  pricingRef: string;
+  effectiveAt: string;
+  sources: readonly string[];
+  rates: ModelRates;
+}> = {
+  pricingRef: "openai-gpt-6-luna-standard-2026-09-22",
+  effectiveAt: "2026-09-22",
+  sources: ["https://developers.openai.com/api/docs/models/gpt-6-luna"],
+  rates: {
+    inputMicrosPerMillion: 100_000,
+    cachedInputMicrosPerMillion: 10_000,
+    outputMicrosPerMillion: 500_000,
+    cacheWriteMultiplier: 1.25,
+  },
+};
+
+export const CLAWROUTER_CLAUDE_OPUS_5_5_PRICING: Readonly<{
+  pricingRef: string;
+  effectiveAt: string;
+  sources: readonly string[];
+  rates: ModelRates;
+}> = {
+  pricingRef: "anthropic-claude-opus-5-5-standard-2026-09-22",
+  effectiveAt: "2026-09-22",
+  sources: ["https://platform.claude.com/docs/en/about-claude/pricing"],
+  rates: {
+    inputMicrosPerMillion: 4_000_000,
+    cachedInputMicrosPerMillion: 200_000,
+    outputMicrosPerMillion: 20_000_000,
+    // The usage event does not expose cache TTL, so use the 1h rate to avoid undercounting.
+    cacheWriteMultiplier: 2,
+  },
+};
+
 const MODEL_RATES: Array<{ match: RegExp; rates: ModelRates }> = [
   {
     match: /claude-opus-5-fast/i,
@@ -75,6 +127,10 @@ const MODEL_RATES: Array<{ match: RegExp; rates: ModelRates }> = [
       cachedInputMicrosPerMillion: 1_000_000,
       outputMicrosPerMillion: 50_000_000,
     },
+  },
+  {
+    match: /claude-opus-5-5/i,
+    rates: CLAWROUTER_CLAUDE_OPUS_5_5_PRICING.rates,
   },
   {
     match: /claude-opus-(4|5)/i,
@@ -105,6 +161,14 @@ const MODEL_RATES: Array<{ match: RegExp; rates: ModelRates }> = [
   // Cached tokens arrive as a separate count from clawrouter/pi (observed:
   // input 10_304 vs cached 76_453 on the same event), so they are not netted
   // out of inputTokens the way the direct-OpenAI gpt-5.5 entry assumes.
+  {
+    match: /gpt-6-luna/i,
+    rates: CLAWROUTER_GPT_6_LUNA_PRICING.rates,
+  },
+  {
+    match: /gpt-6-sol/i,
+    rates: CLAWROUTER_GPT_6_SOL_PRICING.rates,
+  },
   {
     match: /gpt-5\.6-luna/i,
     rates: {

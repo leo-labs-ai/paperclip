@@ -1263,6 +1263,7 @@ const RUNTIME_TOOLS_OPERATIONS = new Set([
 
 const PUBLIC_OPERATIONS = new Set([
   "GET /api/health",
+  "GET /api/health/auth-db",
   "GET /api/openapi.json",
   "GET /api/board-claim/{token}",
   "POST /api/cli-auth/challenges",
@@ -1842,6 +1843,28 @@ registry.registerPath({
             error: z.literal("database_unreachable"),
             serverInfo: healthServerInfoSchema.optional(),
           }),
+        },
+      },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/health/auth-db",
+  tags: ["health"],
+  summary: "Bearer/agent-key auth-path DB readiness probe",
+  description:
+    "Unauthenticated. Probes the same pool `actorMiddleware` draws from via the bounded authDbLookup wrapper used by every Bearer/agent-key DB lookup, so a CloudNativePG failover that leaves that pool stuck is visible here even when the main /api/health check still reports healthy. Intended for the k8s readinessProbe.",
+  responses: {
+    200: r.ok(z.object({ status: z.literal("ready") }).strict()),
+    503: {
+      description: "Service unavailable",
+      content: {
+        "application/json": {
+          schema: z
+            .object({ status: z.enum(["not_ready"]) })
+            .strict(),
         },
       },
     },

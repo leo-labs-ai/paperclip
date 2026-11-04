@@ -23,7 +23,6 @@ import { fileURLToPath } from "node:url";
 import type {
   CodexAppServerTransport,
   CodexRpcNotification,
-  CodexRpcServerRequest,
   CodexServerRequestHandler,
   CodexTraceInterpretation,
   CodexTransportProcessInfo,

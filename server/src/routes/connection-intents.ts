@@ -2,8 +2,6 @@ import { connectionIntentDeliveryService } from "../services/connection-intent-d
 import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import {
-  CONNECTION_REQUEST_TOOL_DESCRIPTION,
-  CONNECTIONS_SEARCH_TOOL_DESCRIPTION,
   completeConnectionIntentSchema,
   connectionRequestInputSchema,
   connectionsSearchInputSchema,

@@ -10,10 +10,6 @@ import {
   validatePrpStructuredRunResult,
   type PrpStructuredRunResult,
 } from "../../protocol/replay-contract.js";
-import {
-  boundedCodexValue,
-  isRetainableCodexPayload,
-} from "./codex-boundaries.js";
 
 export function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)

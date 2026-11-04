@@ -42,6 +42,7 @@ import {
   removeHotRestartIntent,
   writeHotRestartIntent,
 } from "../services/hot-restart.js";
+import { authDbLookup } from "../middleware/auth.js";
 
 function shouldExposeFullHealthDetails(
   actorType: "none" | "board" | "agent" | null | undefined,
@@ -170,6 +171,32 @@ export function healthRoutes(
 ) {
   const router = Router();
   let lastDbProbeSuccessAt: number | null = null;
+
+  // Dedicated readiness signal for the Bearer/agent-key auth path (HOM-441).
+  // Unlike `GET /` above, this probes the *same* pool `actorMiddleware`
+  // draws from (the `db` this router was built with) through `authDbLookup`
+  // — the same timeout+retry wrapper every Bearer/agent-key DB lookup in
+  // `middleware/auth.ts` uses — rather than a separate dedicated probe
+  // connection. A CloudNativePG switchover can leave that shared pool
+  // waiting on a socket that will never answer; this is what actually tells
+  // an operator whether *that* pool, specifically, is usable right now.
+  // Unauthenticated by design (mounted before any session/token check would
+  // matter here) and cheap: one `SELECT 1`, bounded, no error detail beyond
+  // a generic status so an anonymous prober learns nothing about the
+  // database beyond up/down. Wire this path into the k8s `readinessProbe`.
+  router.get("/auth-db", async (_req, res) => {
+    if (!db) {
+      res.status(503).json({ status: "not_ready" });
+      return;
+    }
+    try {
+      await authDbLookup(() => db.execute(sql`SELECT 1`), HEALTH_DB_PROBE_TIMEOUT_MS);
+      res.status(200).json({ status: "ready" });
+    } catch (error) {
+      logger.warn({ err: error }, "Auth DB readiness probe failed");
+      res.status(503).json({ status: "not_ready" });
+    }
+  });
 
   router.post("/dev-server/restart", async (req, res) => {
     const actorType = "actor" in req ? req.actor?.type : null;

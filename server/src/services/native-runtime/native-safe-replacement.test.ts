@@ -294,7 +294,14 @@ const support = externalDatabaseUrl
     it("rolls back a crashed automatic disposition and completes it on the next sweep", async () => {
       const source = await seed(3);
       await reconcileSafeNativeReplacements(db);
+      const [evidence] = await db.insert(heartbeatRunEvents).values({
+        companyId: source.companyId, agentId: source.agentId, runId: source.runId,
+        seq: 100, eventType: "stdout", payload: { evidence: "immutable" },
+      }).returning();
+      await db.update(heartbeatRuns).set({ nextEventSeq: 100 }).where(eq(heartbeatRuns.id, source.runId));
       await expect(settleUnrecoverableExecutions(db, new Date(), { failpoint: () => { throw new Error("crash before commit"); } })).rejects.toThrow("crash before commit");
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.runId)))[0]?.nextEventSeq).toBe(100);
+      expect((await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.id, evidence!.id)))[0]).toEqual(evidence);
       const [before] = await db.select().from(issues).where(eq(issues.id, source.issueId));
       expect(before.status).toBe("in_progress");
       const [pending] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
@@ -302,7 +309,11 @@ const support = externalDatabaseUrl
       await settleUnrecoverableExecutions(db);
       const [after] = await db.select().from(issues).where(eq(issues.id, source.issueId));
       expect(after.status).toBe("blocked");
+      await settleUnrecoverableExecutions(db);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.runId)))[0]?.nextEventSeq).toBe(102);
       const logs = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, source.runId));
+      expect(logs.find(log => log.seq === 100)).toEqual(evidence);
+      expect(logs.find(log => log.seq === 101)?.payload?.automaticRecovery).toBe("preserve_without_replay_v1");
       expect(logs.filter(log => log.payload?.automaticRecovery === "preserve_without_replay_v1")).toHaveLength(1);
     });
     it("does not let the automatic fallback preempt a safe replacement", async () => {

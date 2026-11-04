@@ -31,6 +31,15 @@ describe("model pricing", () => {
   });
 
   it.each([
+    ["gpt-6-sol", 2, 0.2, 10],
+    ["gpt-6-sol-200k", 2, 0.2, 10],
+    ["clawrouter/gpt-6-sol-200k", 2, 0.2, 10],
+    ["gpt-6-luna", 0.1, 0.01, 0.5],
+    ["gpt-6-luna-200k", 0.1, 0.01, 0.5],
+    ["clawrouter/gpt-6-luna-200k", 0.1, 0.01, 0.5],
+    ["claude-opus-5-5", 4, 0.2, 20],
+    ["claude-opus-5-5-200k", 4, 0.2, 20],
+    ["clawrouter/claude-opus-5-5-200k", 4, 0.2, 20],
     ["gpt-5.6-luna", 0.2, 0.02, 1.2],
     ["claude-sonnet-5", 2, 0.2, 10],
     ["openrouter/anthropic/claude-sonnet-5", 2, 0.2, 10],

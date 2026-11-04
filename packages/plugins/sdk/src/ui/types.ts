@@ -20,8 +20,6 @@ import type {
 } from "react";
 import type {
   PluginBridgeErrorCode,
-  PluginLauncherBounds,
-  PluginLauncherRenderEnvironment,
 } from "@paperclipai/shared";
 import type {
   PluginLauncherRenderContextSnapshot,

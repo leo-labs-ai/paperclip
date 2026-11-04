@@ -14,7 +14,6 @@ import {
   readFile,
   realpath,
   rename,
-  stat,
   unlink,
   type FileHandle,
 } from "node:fs/promises";

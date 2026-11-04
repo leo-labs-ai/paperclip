@@ -4254,6 +4254,8 @@ function leaseDb(
     execute: async () => [],
     select,
     update,
+    transaction: async (operation: (transaction: Db) => Promise<unknown>) =>
+      operation(tx as unknown as Db),
   };
   return {
     insert,

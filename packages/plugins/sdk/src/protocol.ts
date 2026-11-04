@@ -19,7 +19,6 @@ import type {
   PaperclipPluginManifestV1,
   PluginLauncherBounds,
   PluginLauncherRenderContextSnapshot,
-  PluginLauncherRenderEnvironment,
   PluginStateScopeKind,
   Company,
   Project,

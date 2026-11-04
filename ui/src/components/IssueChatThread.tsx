@@ -142,7 +142,6 @@ import {
   type MentionOption,
   type MarkdownEditorRef,
 } from "./MarkdownEditor";
-import { Identity } from "./Identity";
 import {
   InlineEntitySelector,
   type InlineEntityOption,

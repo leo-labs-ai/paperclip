@@ -233,6 +233,27 @@ describeEmbeddedPostgres("hidden runner PRP coordinator", () => {
     });
   }
 
+  it("repairs a trailing event cursor while preserving native replay identity", async () => {
+    const seed = await seedNativeRun();
+    const nativeStore = store(seed);
+    const [evidence] = await db.insert(heartbeatRunEvents).values({
+      companyId: seed.companyId, agentId: seed.agentId, runId: seed.runId,
+      seq: 1, eventType: "lifecycle", payload: { evidence: "immutable" },
+    }).returning();
+    const event = runnerEvent(seed);
+    await expect(nativeStore.appendEvent(event)).resolves.toMatchObject({
+      disposition: "committed", cursor: 2, highestContiguousSourceSeq: 1,
+    });
+    await expect(nativeStore.appendEvent(event)).resolves.toMatchObject({
+      disposition: "duplicate", cursor: 2,
+    });
+    await expect(nativeStore.appendEvent({ ...event, priority: 2 }))
+      .rejects.toBeInstanceOf(NativeSessionProtocolIntegrityError);
+    await expect(nativeStore.appendEvent(runnerEvent(seed, 3))).rejects.toThrow("native_event_source_gap");
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seed.runId)))[0]?.nextEventSeq).toBe(3);
+    expect((await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.id, evidence!.id)))[0]).toEqual(evidence);
+  });
+
   it("registers only an exact Codex native binding and exposes read-only tools", async () => {
     const seed = await seedNativeRun();
     const server = createServer();

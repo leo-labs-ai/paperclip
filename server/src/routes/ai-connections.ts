@@ -14,10 +14,8 @@ import {
 } from "@paperclipai/db";
 import {
   createAiConnectionSchema,
-  aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
-  isAiConnectionCompatible,
   type AiConnectionLoginIntent,
   type AiProvider,
   type AiConnectionBinding,

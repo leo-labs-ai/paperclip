@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  DB_SOCKET_TIMEOUT_MARGIN_MS,
   DEFAULT_DATABASE_APPLICATION_NAME,
   DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS,
+  DEFAULT_DB_CONNECT_TIMEOUT_SEC,
   DEFAULT_DB_IDLE_TIMEOUT_SEC,
   DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS,
+  DEFAULT_DB_KEEPALIVE_SEC,
   DEFAULT_DB_MAX_LIFETIME_SEC,
   DEFAULT_DB_STATEMENT_TIMEOUT_MS,
   databaseClientOptionsFromEnv,
@@ -13,12 +16,15 @@ import {
 
 // Fork: when nothing is set, idle/lifetime bounds and session guards default
 // on instead of preserving the driver's unbounded behaviour (CNPG
-// smart-shutdown fix; pool-starvation-503 fix).
+// smart-shutdown fix; pool-starvation-503 fix; HOM-441 failover-reconnect fix).
 const FORK_DEFAULTS = {
   idleTimeoutSeconds: DEFAULT_DB_IDLE_TIMEOUT_SEC,
+  connectTimeoutSeconds: DEFAULT_DB_CONNECT_TIMEOUT_SEC,
   maxLifetimeSeconds: DEFAULT_DB_MAX_LIFETIME_SEC,
   statementTimeoutMs: DEFAULT_DB_STATEMENT_TIMEOUT_MS,
   idleInTransactionTimeoutMs: DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS,
+  keepAliveSeconds: DEFAULT_DB_KEEPALIVE_SEC,
+  socketTimeoutMs: DEFAULT_DB_STATEMENT_TIMEOUT_MS + DB_SOCKET_TIMEOUT_MARGIN_MS,
 };
 
 describe("databaseClientOptionsFromEnv", () => {
@@ -26,7 +32,9 @@ describe("databaseClientOptionsFromEnv", () => {
     expect(databaseClientOptionsFromEnv({})).toEqual(FORK_DEFAULTS);
     expect(postgresJsOptions(databaseClientOptionsFromEnv({}))).toEqual({
       idle_timeout: DEFAULT_DB_IDLE_TIMEOUT_SEC,
+      connect_timeout: DEFAULT_DB_CONNECT_TIMEOUT_SEC,
       max_lifetime: DEFAULT_DB_MAX_LIFETIME_SEC,
+      keep_alive: DEFAULT_DB_KEEPALIVE_SEC,
       connection: {
         statement_timeout: DEFAULT_DB_STATEMENT_TIMEOUT_MS,
         idle_in_transaction_session_timeout: DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS,
@@ -66,6 +74,8 @@ describe("databaseClientOptionsFromEnv", () => {
       maxLifetimeSeconds: 1800,
       statementTimeoutMs: DEFAULT_DB_STATEMENT_TIMEOUT_MS,
       idleInTransactionTimeoutMs: DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS,
+      keepAliveSeconds: DEFAULT_DB_KEEPALIVE_SEC,
+      socketTimeoutMs: DEFAULT_DB_STATEMENT_TIMEOUT_MS + DB_SOCKET_TIMEOUT_MARGIN_MS,
       applicationName: "paperclip-web",
     });
   });
@@ -131,7 +141,9 @@ describe("resolveDatabaseClientOptions", () => {
     // timeout and session guards, so only application_name comes from here.
     expect(postgresJsOptions(resolveDatabaseClientOptions(databaseClientOptionsFromEnv({})))).toEqual({
       idle_timeout: DEFAULT_DB_IDLE_TIMEOUT_SEC,
+      connect_timeout: DEFAULT_DB_CONNECT_TIMEOUT_SEC,
       max_lifetime: DEFAULT_DB_MAX_LIFETIME_SEC,
+      keep_alive: DEFAULT_DB_KEEPALIVE_SEC,
       connection: {
         statement_timeout: DEFAULT_DB_STATEMENT_TIMEOUT_MS,
         idle_in_transaction_session_timeout: DEFAULT_DB_IDLE_IN_TX_TIMEOUT_MS,
@@ -151,5 +163,32 @@ describe("resolveDatabaseClientOptions", () => {
     expect(postgresJsOptions(resolveDatabaseClientOptions({ idleTimeoutSeconds: 0 }))).toMatchObject({
       idle_timeout: 0,
     });
+  });
+});
+
+describe("postgresJsOptions HA-failover wiring (HOM-441)", () => {
+  it("omits connect_timeout entirely when the knob is 0, restoring the driver default", () => {
+    // Passing `connect_timeout: 0` through would disable the driver's connect
+    // timer outright (postgres.js's `timer()` treats a falsy value as "no
+    // timer"), the opposite of what `0` is documented to mean.
+    const options = databaseClientOptionsFromEnv({ PAPERCLIP_DB_CONNECT_TIMEOUT_SEC: "0" });
+    expect(options.connectTimeoutSeconds).toBe(0);
+    expect(postgresJsOptions(options)).not.toHaveProperty("connect_timeout");
+  });
+
+  it("keeps the driver's own dial when no connection string is supplied", () => {
+    // Without a URL the host count cannot be checked, and the custom factory
+    // only ever dials host[0] -- installing it on an unverified target would
+    // silently disable the driver's multi-host rotation.
+    expect(postgresJsOptions(databaseClientOptionsFromEnv({}))).not.toHaveProperty("socket");
+  });
+
+  it("keeps the driver's own dial for a multi-host connection string", () => {
+    // The custom-socket branch of postgres.js's `connect()` skips its
+    // per-connection host rotation (`hostIndex`), which a shared factory
+    // cannot reproduce, so a multi-host URL keeps the driver's dial.
+    const options = databaseClientOptionsFromEnv({});
+    expect(postgresJsOptions(options, "postgres://u:p@h1,h2:5432/db")).not.toHaveProperty("socket");
+    expect(postgresJsOptions(options, "postgres://u:p@h1:5432/db")).toHaveProperty("socket", expect.any(Function));
   });
 });

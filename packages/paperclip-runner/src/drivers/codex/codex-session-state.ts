@@ -30,7 +30,7 @@ import type {
   OpenedCodexThread,
   PendingRuntimeRequest,
 } from "./codex-driver-types.js";
-import { canonicalJson, record } from "./codex-driver-values.js";
+import { canonicalJson } from "./codex-driver-values.js";
 
 class AsyncQueue<T> implements AsyncIterable<T> {
   #values: T[] = [];

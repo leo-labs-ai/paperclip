@@ -7,6 +7,7 @@ import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
+import { withAuthDbTimeout } from "../middleware/auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 
@@ -316,11 +317,18 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
-    void authorizeUpgrade(db, req, companyId, url, {
-      deploymentMode: opts.deploymentMode,
-      resolveSessionFromHeaders: opts.resolveSessionFromHeaders,
-      resolveCloudActor: opts.resolveCloudActor,
-    })
+    // Every branch of authorizeUpgrade queries the same pool as the HTTP auth
+    // path, so it needs the same wall-clock bound (HOM-441): after a primary
+    // switchover an unbounded await parks the upgrade socket forever and
+    // leaves the board's live feed dead until a pod restart. The rejection
+    // path below turns an expiry into a refused upgrade the browser retries.
+    void withAuthDbTimeout(() =>
+      authorizeUpgrade(db, req, companyId, url, {
+        deploymentMode: opts.deploymentMode,
+        resolveSessionFromHeaders: opts.resolveSessionFromHeaders,
+        resolveCloudActor: opts.resolveCloudActor,
+      }),
+    )
       .then((context) => {
         if (!context) {
           rejectUpgrade(socket, "403 Forbidden", "forbidden");
