@@ -131,4 +131,36 @@ describeEmbeddedPostgres("account issuer migration", () => {
       VALUES (${`account-${randomUUID()}`}, 'github-subject-2', 'github', ${socialUserId}, now(), now())
     `;
   }, 30_000);
+
+  it("refuses to drop the issuer index while (provider_id, account_id) pairs collide", async () => {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-account-issuer-dup-");
+    cleanups.push(database.cleanup);
+    const sql = postgres(database.connectionString, { max: 1 });
+    cleanups.push(async () => sql.end());
+
+    // Rewind only 0287 and restore the 1.7.2 shape it relaxes.
+    await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash(MIGRATION_FILES[1]!)}`;
+    await sql`CREATE UNIQUE INDEX IF NOT EXISTS ${sql(UNIQUE_INDEX)} ON "account" ("issuer", "account_id")`;
+
+    const userId = `user-${randomUUID()}`;
+    await sql`
+      INSERT INTO "user" ("id", "name", "email", "created_at", "updated_at")
+      VALUES (${userId}, 'Dup User', 'dup@example.com', now(), now())
+    `;
+    // Valid under the issuer index, ambiguous for Better Auth 1.7.3+.
+    await sql`
+      INSERT INTO "account"
+        ("id", "issuer", "account_id", "provider_id", "user_id", "created_at", "updated_at")
+      VALUES
+        (${`account-${randomUUID()}`}, 'https://a.example', 'subject-1', 'oidc', ${userId}, now(), now()),
+        (${`account-${randomUUID()}`}, 'https://b.example', 'subject-1', 'oidc', ${userId}, now(), now())
+    `;
+
+    await expect(applyPendingMigrations(database.connectionString)).rejects.toThrow();
+    const indexes = await sql<{ indexname: string }[]>`
+      SELECT "indexname" FROM "pg_indexes"
+      WHERE "tablename" = 'account' AND "indexname" = ${UNIQUE_INDEX}
+    `;
+    expect(indexes).toHaveLength(1);
+  }, 30_000);
 });
