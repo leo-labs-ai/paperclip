@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import http2 from "node:http2";
 import net from "node:net";
-import { duplexPair, type Duplex } from "node:stream";
+import { duplexPair } from "node:stream";
 import { execFile, spawn } from "node:child_process";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
