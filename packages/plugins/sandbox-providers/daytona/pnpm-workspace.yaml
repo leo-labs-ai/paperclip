@@ -4,3 +4,12 @@ packages:
 # The SDK ships generated protobuf code; its optional install script is not needed.
 allowBuilds:
   protobufjs: false
+
+# Security patches (Dependabot): lift only vulnerable ranges to the first
+# patched release in the same major.
+overrides:
+  "shell-quote@>=1.8.4 <1.11.0": "1.11.0"
+  "@grpc/grpc-js@>=1.14.0 <1.14.5": "1.14.5"
+  "follow-redirects@>=1.16.0 <1.16.2": "1.16.2"
+  "source-map-js@>=1.0.0 <1.2.2": "1.2.2"
+  "vite@>=8.2.0 <8.2.4": "8.2.4"

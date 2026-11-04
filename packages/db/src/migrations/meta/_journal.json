@@ -1996,6 +1996,13 @@
       "when": 1789390281190,
       "tag": "0286_tired_deathstrike",
       "breakpoints": true
+    },
+    {
+      "idx": 287,
+      "version": "7",
+      "when": 1793828289301,
+      "tag": "0287_better_auth_account_issuer_nullable",
+      "breakpoints": true
     }
   ]
 }
