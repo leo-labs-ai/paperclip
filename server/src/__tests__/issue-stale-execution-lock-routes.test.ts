@@ -486,9 +486,12 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     // was cleared by releaseIssueExecutionAndPromote, but checkoutRunId stayed
     // pinned to the dead run. The new agent's POST /checkout would 409 forever
     // without the clearCheckoutRunIfTerminal helper in svc.checkout.
-    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+    const { companyId, failedRunId } = await seedCompanyAgentAndRuns();
     const issueId = randomUUID();
     const otherAgentId = randomUUID();
+    // The header run must belong to the checking-out agent. currentRunId is
+    // owned by the previous agent and is correctly unknown for this actor.
+    const otherRunId = randomUUID();
     await db.insert(agents).values({
       id: otherAgentId,
       companyId,
@@ -499,6 +502,14 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       adapterConfig: {},
       runtimeConfig: {},
       permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId: otherAgentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
     });
     await db.insert(issues).values({
       id: issueId,
@@ -515,7 +526,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionLockedAt: null,
     });
 
-    const res = await request(createApp(agentActor(companyId, otherAgentId, currentRunId)))
+    const res = await request(createApp(agentActor(companyId, otherAgentId, otherRunId)))
       .post(`/api/issues/${issueId}/checkout`)
       .send({
         agentId: otherAgentId,
@@ -537,8 +548,8 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(row).toEqual({
       status: "in_progress",
       assigneeAgentId: otherAgentId,
-      checkoutRunId: currentRunId,
-      executionRunId: currentRunId,
+      checkoutRunId: otherRunId,
+      executionRunId: otherRunId,
     });
   });
 });
