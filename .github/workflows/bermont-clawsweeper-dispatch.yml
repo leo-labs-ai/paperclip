@@ -4,7 +4,7 @@
 # valkyriweb/clawsweeper and the bermont-clawsweeper GitHub App.
 #
 # Setup (per target repo — paperclip is done as of this PR except the App install):
-#   1. Install the bermont-clawsweeper App on lue-labs/paperclip (Only select repositories).
+#   1. Install the bermont-clawsweeper App on leo-labs-ai/paperclip (Only select repositories).
 #   2. Set repo secret CLAWSWEEPER_APP_PRIVATE_KEY from 1Password vault
 #      "Bermont Digital" item "GitHub App — bermont-clawsweeper" / private_key field.
 #   3. This file lives on master (default branch — so issues/issue_comment,
@@ -62,7 +62,7 @@ jobs:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
           # The dispatcher App and its target repository remain in valkyriweb;
-          # GITHUB_REPOSITORY identifies lue-labs/paperclip as the event source.
+          # GITHUB_REPOSITORY identifies leo-labs-ai/paperclip as the event source.
           owner: valkyriweb
           repositories: clawsweeper
           permission-contents: write
