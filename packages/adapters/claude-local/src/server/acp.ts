@@ -1,3 +1,9 @@
+import {
+  resolveClaudeExecutionRoute,
+  resolveClaudeClawRouterRoute,
+  claudeRouteExecutionFailure,
+  claudeRouteProbeFailure,
+} from "./clawrouter-route.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -358,6 +364,9 @@ export function mapClaudeAcpAuthErrorCode(
 export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}): ClaudeAcpExecutor {
   let executor: ClaudeAcpExecutor | null = null;
   return async (ctx) => {
+    const route = resolveClaudeExecutionRoute(ctx);
+    if (route.error !== undefined) return claudeRouteExecutionFailure(route.error);
+    ctx = { ...ctx, config: route.config };
     let currentExecutor = executor;
     if (!currentExecutor) {
       const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");
@@ -691,6 +700,9 @@ export async function probeClaudeAcpSandboxLogin(input: {
 export async function testClaudeAcpEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
+  const route = resolveClaudeClawRouterRoute(parseObject(ctx.config), ctx.executionTarget?.kind === "remote");
+  if (route.error !== undefined) return claudeRouteProbeFailure(ctx.adapterType, route.error);
+  ctx = { ...ctx, config: route.config };
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
   const target = ctx.executionTarget ?? null;
@@ -777,7 +789,8 @@ export async function testClaudeAcpEnvironment(
     isNonEmpty(envConfig.ANTHROPIC_BEDROCK_BASE_URL) ||
     (considerHostEnv && isNonEmpty(process.env.ANTHROPIC_BEDROCK_BASE_URL));
   const configApiKey = envConfig.ANTHROPIC_API_KEY;
-  const hostApiKey = considerHostEnv ? process.env.ANTHROPIC_API_KEY : undefined;
+  const hostApiKey = considerHostEnv && envConfig.ANTHROPIC_API_KEY === undefined
+    ? process.env.ANTHROPIC_API_KEY : undefined;
   const hostOauthToken = considerHostEnv ? process.env.CLAUDE_CODE_OAUTH_TOKEN : undefined;
   const hostAuthToken = considerHostEnv ? process.env.ANTHROPIC_AUTH_TOKEN : undefined;
   const hostConfigDir = considerHostEnv ? process.env.CLAUDE_CONFIG_DIR : undefined;

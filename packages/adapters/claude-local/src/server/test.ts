@@ -1,3 +1,4 @@
+import { resolveClaudeClawRouterRoute, claudeRouteProbeFailure } from "./clawrouter-route.js";
 import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestContext,
@@ -65,6 +66,9 @@ function localExecutablesMatch(
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
+  const route = resolveClaudeClawRouterRoute(parseObject(ctx.config), ctx.executionTarget?.kind === "remote");
+  if (route.error !== undefined) return claudeRouteProbeFailure(ctx.adapterType, route.error);
+  ctx = { ...ctx, config: route.config };
   const engineSelection = await resolveClaudeExecutionEngineForRun({
     config: parseObject(ctx.config),
     executionTarget: ctx.executionTarget,
