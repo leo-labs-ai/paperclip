@@ -1,4 +1,5 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -317,7 +318,7 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
-async function runPgDumpBackup(opts: {
+export async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
@@ -335,10 +336,7 @@ async function runPgDumpBackup(opts: {
     ],
     {
       stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        PGCONNECT_TIMEOUT: String(opts.connectTimeout),
-      },
+      env: { ...process.env, PGCONNECT_TIMEOUT: String(opts.connectTimeout) },
     },
   );
 
@@ -346,10 +344,25 @@ async function runPgDumpBackup(opts: {
     throw new Error("pg_dump did not expose stdout");
   }
 
-  await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
-    waitForChildExit(child, pgDumpBin),
-  ]);
+  const controller = new AbortController();
+  const transfer = pipeline(
+    child.stdout,
+    createGzip(),
+    createWriteStream(opts.backupFile, { flags: "wx", mode: 0o600 }),
+    { signal: controller.signal },
+  );
+  const completion = waitForChildExit(child, pgDumpBin);
+  try {
+    await Promise.all([transfer, completion]);
+    if (statSync(opts.backupFile).size <= 20) throw new Error("pg_dump produced an empty backup");
+  } catch (error) {
+    controller.abort();
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    // A rejected spawn can race the output stream's open. Drain both before
+    // the caller removes the partial file or starts the fallback writer.
+    await Promise.allSettled([transfer, completion]);
+    throw error;
+  }
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
@@ -364,10 +377,7 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
     ],
     {
       stdio: ["pipe", "ignore", "pipe"],
-      env: {
-        ...process.env,
-        PGCONNECT_TIMEOUT: String(connectTimeout),
-      },
+      env: { ...process.env, PGCONNECT_TIMEOUT: String(connectTimeout) },
     },
   );
 
@@ -443,7 +453,7 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
 }
 
 export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES) {
-  const filePromise = openFile(filePath, "w");
+  const filePromise = openFile(filePath, "wx", 0o600);
   const flushThreshold = Math.max(1, Math.trunc(maxBufferedBytes));
   let bufferedLines: string[] = [];
   let bufferedBytes = 0;
@@ -502,9 +512,12 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       if (closed) return;
       closed = true;
       flushBufferedLines();
-      await pendingWrite;
       const file = await filePromise;
-      await file.close();
+      try {
+        await pendingWrite;
+      } finally {
+        await file.close();
+      }
     },
     async abort() {
       if (closed) return;
@@ -541,8 +554,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await sql.end();
   };
   mkdirSync(opts.backupDir, { recursive: true });
-  const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
-  const backupFile = `${sqlFile}.gz`;
+  const backupBase = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}-${randomUUID()}.sql`);
+  const sqlFile = `${backupBase}.partial`;
+  const backupFile = `${backupBase}.gz`;
+  const partialBackupFile = `${backupFile}.partial`;
   const writer = createBufferedTextFileWriter(sqlFile);
 
   try {
@@ -552,20 +567,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await closeSql();
         await runPgDumpBackup({
           connectionString: opts.connectionString,
-          backupFile,
+          backupFile: partialBackupFile,
           connectTimeout,
         });
-        await writer.abort();
-        const sizeBytes = statSync(backupFile).size;
-        const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
-        return {
-          backupFile,
-          sizeBytes,
-          prunedCount,
-        };
       } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
+        if (existsSync(partialBackupFile)) {
+          try { unlinkSync(partialBackupFile); } catch { /* ignore */ }
         }
         if (backupEngine === "pg_dump") {
           throw error;
@@ -573,6 +580,17 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         effectiveBackupEngine = "javascript";
         sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
         sqlClosed = false;
+      }
+      if (effectiveBackupEngine !== "javascript") {
+        await writer.abort();
+        renameSync(partialBackupFile, backupFile);
+        const sizeBytes = statSync(backupFile).size;
+        const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+        return {
+          backupFile,
+          sizeBytes,
+          prunedCount,
+        };
       }
     }
 
@@ -1022,9 +1040,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     // Compress the SQL file with gzip
     const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
+    const gzWriteStream = createWriteStream(partialBackupFile, { flags: "wx", mode: 0o600 });
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
     unlinkSync(sqlFile);
+    renameSync(partialBackupFile, backupFile);
 
     const sizeBytes = statSync(backupFile).size;
     const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
@@ -1036,8 +1055,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     };
   } catch (error) {
     await writer.abort();
-    if (existsSync(backupFile)) {
-      try { unlinkSync(backupFile); } catch { /* ignore */ }
+    if (existsSync(partialBackupFile)) {
+      try { unlinkSync(partialBackupFile); } catch { /* ignore */ }
     }
     if (existsSync(sqlFile)) {
       try { unlinkSync(sqlFile); } catch { /* ignore */ }

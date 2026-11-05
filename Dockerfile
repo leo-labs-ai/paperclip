@@ -218,7 +218,8 @@ COPY docker/otel/traceloop-init.js /opt/otel/preload/traceloop-init.js
 COPY --from=invoicegen /usr/local/bin/invoicegen /usr/local/bin/invoicegen
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends openssh-client jq gnupg \
+  && apt-get install -y --no-install-recommends openssh-client jq gnupg postgresql-client-17 \
+  && pg_dump --version \
   && curl -sS https://downloads.1password.com/linux/keys/1password.asc \
     | gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg \
   && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/$(dpkg --print-architecture) stable main" \

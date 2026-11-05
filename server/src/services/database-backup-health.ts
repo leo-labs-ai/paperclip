@@ -88,6 +88,9 @@ function findLatestBackup(backupDir: string, nowMs: number) {
       const stat = statSync(fullPath);
       return { fullPath, name, stat };
     })
+    // Empty gzip streams are 20 bytes. They are not usable SQL backups, and
+    // can remain from older writers that published before pg_dump completed.
+    .filter(({ stat }) => stat.isFile() && stat.size > 20)
     .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
 
   const latest = candidates[0];
