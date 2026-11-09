@@ -1,9 +1,17 @@
-import { recordNativeLocalProcessStop } from "../native-local-process-stop.js";
+import { notifyExecutionRunWork } from "../execution-control-notifications.js";
+import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
+import { activeNativeExecutionRunIds, NATIVE_PREPARATION_FENCING_VERSION } from "./native-active-runs.js";
+import {
+  PROCESS_IDENTITY_RECORDED,
+  PROCESS_START_REQUESTED,
+  recordNativeLocalProcessStop,
+} from "../native-local-process-stop.js";
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
   issues,
@@ -13,8 +21,9 @@ import { readProcessStartedAt } from "../hot-restart.js";
 import { getServerInfoSnapshot } from "../../server-info.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
-import { reportRunFailure } from "../run-failure-report.js";
+import { isNewTerminalRunFailure, reportRunFailure } from "../run-failure-report.js";
 import { isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
+import { nativeRestartInterruptedTurnId, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 
 export type NativeControllerIdentity = {
   bootId: string;
@@ -38,6 +47,16 @@ export type NativeRestartRecoveryClaim =
         processGroupId: number | null;
         startedAt: string;
       };
+    }
+  | {
+      kind: "reattach_remote_runner";
+      runId: string;
+      leaseOwner: string;
+      controllerGeneration: number;
+      providerAttempt: number;
+      restartKind: NativeRestartKind;
+      recoveryRequestId: string | null;
+      remote: { providerLeaseId: string; remoteCwd: string };
     }
   | {
       kind: "resume_dead_runner";
@@ -70,7 +89,8 @@ export function nextNativeProviderAttempt(
   currentAttempt: number,
   recoveryKind?: NativeRestartRecoveryClaim["kind"],
 ): number {
-  return recoveryKind === "reattach_existing_runner"
+  return recoveryKind === "reattach_existing_runner" ||
+    recoveryKind === "reattach_remote_runner"
     ? currentAttempt
     : currentAttempt + 1;
 }
@@ -159,11 +179,12 @@ export async function evaluateNativeControllerTakeover(input: {
   } | null;
   isProcessAlive?: (pid: number) => boolean;
   readProcessStartedAt?: (pid: number) => Promise<Date | null>;
+  requireStoppedController?: boolean;
 }): Promise<{ allowed: boolean; reason: string }> {
   const { owner, now } = input;
   const isAlive = input.isProcessAlive ?? processIsAlive;
   const readStartedAt = input.readProcessStartedAt ?? observedProcessStart;
-  if (!owner.leaseOwner || !owner.leaseExpiresAt) {
+  if ((!owner.leaseOwner || !owner.leaseExpiresAt) && !input.requireStoppedController) {
     return { allowed: true, reason: "unowned" };
   }
 
@@ -172,7 +193,7 @@ export async function evaluateNativeControllerTakeover(input: {
     return {
       allowed: false,
       reason:
-        owner.leaseExpiresAt <= now
+        owner.leaseExpiresAt !== null && owner.leaseExpiresAt <= now
           ? "expired_lease_without_controller_identity"
           : "live_legacy_lease_without_controller_identity",
     };
@@ -181,7 +202,7 @@ export async function evaluateNativeControllerTakeover(input: {
     return {
       allowed: true,
       reason:
-        owner.leaseExpiresAt <= now
+        owner.leaseExpiresAt !== null && owner.leaseExpiresAt <= now
           ? "expired_lease_controller_process_dead"
           : "controller_process_dead",
     };
@@ -273,6 +294,8 @@ export async function evaluateNativeProviderProcesses(input: {
 export function classifyNativeRunnerRecoveryEvidence(input: {
   runnerPidAlive: boolean;
   runnerGroupAlive: boolean;
+  remoteSandbox?: boolean;
+  unclaimedBootstrap?: boolean;
   processStartMatches: boolean;
   knownProviderProcessAlive?: boolean;
   knownProviderProcessIdentityAmbiguous?: boolean;
@@ -290,6 +313,22 @@ export function classifyNativeRunnerRecoveryEvidence(input: {
       claimKind: null,
       reason: "provider_checkpoint_permanently_failed",
     };
+  // Sandbox PIDs belong to another host. This claim only authorizes remote
+  // inspection; the executor must prove the original lease and authenticate
+  // the surviving runner before it can resume delivery.
+  if (input.remoteSandbox) {
+    if (input.unclaimedBootstrap === true && !input.hasCheckpoint && !input.hasProviderEvidence) {
+      return { claimKind: "bootstrap_incomplete", reason: "remote_execution_never_claimed" };
+    }
+    return input.hasCheckpoint &&
+      input.checkpointIdentityMatches === true &&
+      input.hasProviderEvidence
+      ? {
+          claimKind: "reattach_remote_runner",
+          reason: "remote_runner_requires_sandbox_verification",
+        }
+      : { claimKind: null, reason: "ambiguous_remote_recovery_evidence" };
+  }
   if (input.runnerPidAlive && input.processStartMatches) {
     return {
       claimKind: "reattach_existing_runner",
@@ -369,7 +408,8 @@ function historyEntry(input: {
     disposition: input.disposition,
     reason: input.reason,
     stateRootAction:
-      input.disposition === "reattach_existing_runner"
+      input.disposition === "reattach_existing_runner" ||
+      input.disposition === "reattach_remote_runner"
         ? "reopen_exact_root"
         : input.disposition === "resume_dead_runner"
           ? "reuse_exact_root"
@@ -584,8 +624,20 @@ export async function claimNativeRestartRecoveries(input: {
         } as const;
       }
 
-      const runnerPidAlive = processIsAlive(row.run.processPid);
-      const runnerGroupAlive = processGroupIsAlive(row.run.processGroupId);
+      const profile = row.run.runnerProfileJson ?? {};
+      const remoteWorkspace = readNativeWorkspaceSyncReference(
+        profile.nativeWorkspaceSync,
+      );
+      const [pluginTask] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, row.run.companyId), eq(environmentLeases.heartbeatRunId, row.run.id),
+        sql`${environmentLeases.metadata}->>'runnerTaskLease' = 'true'`,
+      )).limit(1);
+      const remoteSandbox = profile.nativeWorkspaceSync != null;
+      const remoteProcess = remoteSandbox || !!pluginTask;
+      const runnerPidAlive =
+        !remoteProcess && processIsAlive(row.run.processPid);
+      const runnerGroupAlive =
+        !remoteProcess && processGroupIsAlive(row.run.processGroupId);
       const observedRunnerStart =
         row.run.processPid && runnerPidAlive
           ? await observedProcessStart(row.run.processPid)
@@ -595,7 +647,6 @@ export async function claimNativeRestartRecoveries(input: {
         row.run.processPid !== null &&
         sameProcessStart(row.run.processStartedAt, observedRunnerStart);
 
-      const profile = row.run.runnerProfileJson ?? {};
       const checkpoint = profile.sessionCheckpoint;
       const checkpointRecord =
         checkpoint &&
@@ -709,14 +760,61 @@ export async function claimNativeRestartRecoveries(input: {
         }
       }
       const providerProcesses = await evaluateNativeProviderProcesses({
-        identities: providerProcessIdentities.filter(
+        identities: (remoteProcess ? [] : providerProcessIdentities).filter(
           (identity) => identity.pid !== row.run.processPid,
         ),
       });
       const hasProviderEvidence =
         hasCheckpointProviderIdentity || providerEvents.length > 0;
 
+      let unclaimedBootstrap =
+        remoteWorkspace?.state === "prepared" &&
+        row.run.runnerProfileJson?.nativePreparationFencingVersion === NATIVE_PREPARATION_FENCING_VERSION &&
+        row.coordinator.phase === "observed" &&
+        row.coordinator.attempt === 0 &&
+        row.coordinator.controllerGeneration === 0 &&
+        !row.coordinator.controllerBootId &&
+        !row.coordinator.controllerPid &&
+        !row.coordinator.controllerProcessStartedAt &&
+        !row.coordinator.leaseOwner &&
+        !row.coordinator.leaseExpiresAt &&
+        !row.coordinator.failureDetail?.successorRunId &&
+        !row.run.processPid &&
+        !row.run.processGroupId &&
+        !row.run.processStartedAt &&
+        !row.run.sessionIdBefore &&
+        !row.run.sessionIdAfter &&
+        Boolean(row.run.nativeSessionId && row.run.runnerInstanceId) &&
+        !hasCheckpoint &&
+        !hasProviderEvidence;
+      if (unclaimedBootstrap) {
+        if (activeNativeExecutionRunIds.has(row.run.id) &&
+            controller.bootId === (await currentNativeControllerIdentity()).bootId) {
+          return { kind: "awaiting_evidence", runId: row.run.id, reason: "current_controller_preparing" } as const;
+        }
+        const [executionEvent] = await tx
+          .select({ id: heartbeatRunEvents.id })
+          .from(heartbeatRunEvents)
+          .where(and(
+            eq(heartbeatRunEvents.companyId, row.run.companyId),
+            eq(heartbeatRunEvents.runId, row.run.id),
+            or(
+              isNotNull(heartbeatRunEvents.sourceEventId),
+              inArray(heartbeatRunEvents.eventType, [
+                "adapter.invoke",
+                PROCESS_START_REQUESTED,
+                PROCESS_IDENTITY_RECORDED,
+                "tool.execution.started",
+              ]),
+            ),
+          ))
+          .limit(1);
+        unclaimedBootstrap = !executionEvent;
+      }
+
       const classification = classifyNativeRunnerRecoveryEvidence({
+        remoteSandbox,
+        unclaimedBootstrap,
         runnerPidAlive,
         runnerGroupAlive,
         processStartMatches: exactRunnerIdentity,
@@ -724,11 +822,14 @@ export async function claimNativeRestartRecoveries(input: {
         knownProviderProcessIdentityAmbiguous:
           providerProcesses.ambiguousLivePids.length > 0,
         hasCheckpoint,
-        checkpointIdentityMatches,
+        checkpointIdentityMatches:
+          checkpointIdentityMatches &&
+          (!remoteSandbox || remoteWorkspace !== null),
         hasProviderEvidence,
         checkpointFailed:
           (checkpointRecord.terminal as Record<string, unknown> | undefined)
-            ?.runTerminalState === "failed",
+            ?.runTerminalState === "failed" &&
+          nativeRestartInterruptedTurnId(checkpointRecord as unknown as PersistedNativeSession) === null,
         providerAttempt: row.coordinator.attempt,
       });
       const ownershipChanged =
@@ -761,6 +862,7 @@ export async function claimNativeRestartRecoveries(input: {
           recycledProviderPids: providerProcesses.recycledPids,
           stderrTail: row.run.stderrExcerpt,
         });
+        await notifyExecutionRunWork(tx);
         await tx
           .update(nativeRunFinalizations)
           .set({
@@ -801,7 +903,7 @@ export async function claimNativeRestartRecoveries(input: {
           })
           .where(eq(heartbeatRuns.id, row.run.id))
           .returning();
-        if (updatedRun && updatedRun.status !== row.run.status) {
+        if (updatedRun && isNewTerminalRunFailure(row.run, updatedRun)) {
           terminalRunToReport = updatedRun;
         }
         await tx
@@ -885,7 +987,8 @@ export async function claimNativeRestartRecoveries(input: {
           controllerProcessStartedAt: controller.processStartedAt,
           controllerGeneration: generation,
           recoveryState:
-            claimKind === "reattach_existing_runner"
+            claimKind === "reattach_existing_runner" ||
+            claimKind === "reattach_remote_runner"
               ? "awaiting_runner_reattach"
               : claimKind === "resume_dead_runner"
                 ? "resuming_session"
@@ -919,7 +1022,10 @@ export async function claimNativeRestartRecoveries(input: {
         } as const;
       }
 
-      if (claimKind !== "reattach_existing_runner") {
+      if (
+        claimKind !== "reattach_existing_runner" &&
+        claimKind !== "reattach_remote_runner"
+      ) {
         await recordNativeLocalProcessStop(tx as unknown as Db, row.run);
       }
 
@@ -932,7 +1038,8 @@ export async function claimNativeRestartRecoveries(input: {
           errorCode: null,
           nativePhase: "observed",
           nativePhaseUpdatedAt: now,
-          ...(claimKind === "reattach_existing_runner"
+          ...(claimKind === "reattach_existing_runner" ||
+          claimKind === "reattach_remote_runner"
             ? {}
             : {
                 processPid: null,
@@ -951,6 +1058,16 @@ export async function claimNativeRestartRecoveries(input: {
         restartKind: input.restartKind,
         recoveryRequestId: input.recoveryRequestId ?? null,
       };
+      if (claimKind === "reattach_remote_runner") {
+        return {
+          kind: claimKind,
+          ...common,
+          remote: {
+            providerLeaseId: remoteWorkspace!.providerLeaseId,
+            remoteCwd: remoteWorkspace!.remoteCwd,
+          },
+        } satisfies NativeRestartRecoveryClaim;
+      }
       if (claimKind === "reattach_existing_runner") {
         return {
           kind: claimKind,
@@ -967,7 +1084,8 @@ export async function claimNativeRestartRecoveries(input: {
         ...common,
       } satisfies NativeRestartRecoveryClaim;
     });
-    if (terminalRunToReport) void reportRunFailure(input.db, terminalRunToReport);
+    if (terminalRunToReport)
+      void reportRunFailure(input.db, terminalRunToReport);
     dispositions.push(disposition);
   }
   return dispositions;

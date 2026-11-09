@@ -1,9 +1,12 @@
 import { createReadStream, createWriteStream, promises as fs } from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createGzip, createGunzip } from "node:zlib";
 import { pipeline } from "node:stream/promises";
+import { addAbortSignal } from "node:stream";
 import type { Readable } from "node:stream";
+import { createS3StorageProvider } from "../storage/s3-provider.js";
+import type { StorageProvider } from "../storage/types.js";
 import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
@@ -29,22 +32,35 @@ export const RUN_LOG_OBJECT_NAMESPACE = "run-logs";
 
 /** Minimal storage surface the store needs to stream an archived (s3) run-log back. */
 export interface RunLogS3Reader {
-  getObject(input: { objectKey: string }): Promise<{ stream: Readable }>;
+  getObject(input: { objectKey: string; signal?: AbortSignal }): Promise<{ stream: Readable }>;
 }
 
 export interface CreateRunLogStoreOptions {
-  /** When set, `read()` can resolve `store: "s3"` handles by streaming from object storage. */
+  /** When set, `read()` can resolve archived `store: "s3"` handles. */
   s3Reader?: RunLogS3Reader | null;
+}
+
+export interface DurableRunLogStoreOptions extends CreateRunLogStoreOptions {
+  basePath: string;
+  // Mirrors active and finalized logs to object storage. This is separate from
+  // the fork's cold-archive reader, which serves compressed archived handles.
+  s3?: {
+    provider: StorageProvider;
+    keyPrefix?: string;
+    inflightMirrorMs?: number;
+  };
 }
 
 export interface RunLogHandle {
   store: RunLogStoreType;
   logRef: string;
+  attemptId?: string;
 }
 
 export interface RunLogReadOptions {
   offset?: number;
   limitBytes?: number;
+  signal?: AbortSignal;
 }
 
 export interface RunLogReadResult {
@@ -53,10 +69,10 @@ export interface RunLogReadResult {
 }
 
 export interface RunLogFinalizeSummary {
-  /** Byte length of the ORIGINAL, uncompressed log content. */
-  bytes: number;
-  /** sha256 of the ORIGINAL, uncompressed log content. */
-  sha256?: string;
+  /** Byte length of the ORIGINAL, uncompressed log content; null if writes did not settle. */
+  bytes: number | null;
+  /** sha256 of the ORIGINAL, uncompressed log content; null if writes did not settle. */
+  sha256?: string | null;
   compressed: boolean;
   /** Final relative logRef to persist — `.ndjson.gz` when compressed, else `.ndjson`. */
   logRef: string;
@@ -70,10 +86,20 @@ export interface RunLogStore {
   ): Promise<number>;
   finalize(handle: RunLogHandle): Promise<RunLogFinalizeSummary>;
   read(handle: RunLogHandle, opts?: RunLogReadOptions): Promise<RunLogReadResult>;
+  flushInflightMirrors?(): Promise<void>;
 }
 
 function safeSegments(...segments: string[]) {
   return segments.map((segment) => segment.replace(/[^a-zA-Z0-9._-]/g, "_"));
+}
+
+function normalizeKeyPrefix(prefix: string | undefined): string {
+  if (!prefix) return "";
+  return prefix.trim().split("/").filter(Boolean).join("/");
+}
+
+function attachAbortSignal(stream: Readable, signal?: AbortSignal): Readable {
+  return signal ? addAbortSignal(signal, stream) : stream;
 }
 
 function resolveWithin(basePath: string, relativePath: string) {
@@ -227,6 +253,18 @@ export async function gzipFileToGz(srcAbs: string, destAbs: string): Promise<voi
   }
 }
 
+async function gunzipFileToRaw(srcAbs: string, destAbs: string): Promise<void> {
+  const tmpAbs = `${destAbs}.tmp`;
+  try {
+    await pipeline(createReadStream(srcAbs), createGunzip(), createWriteStream(tmpAbs, { flags: "wx", mode: 0o600 }));
+    await fs.rename(tmpAbs, destAbs);
+    await fs.unlink(srcAbs);
+  } catch (err) {
+    await fs.unlink(tmpAbs).catch(() => undefined);
+    throw err;
+  }
+}
+
 /** Absolute base dir the default run-log store reads/writes (env-overridable). */
 export function resolveRunLogBasePath(): string {
   return process.env.RUN_LOG_BASE_PATH ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
@@ -313,29 +351,91 @@ export async function prepareRunLogArchiveSource(
   };
 }
 
-export function createLocalFileRunLogStore(
-  basePath: string,
-  options?: CreateRunLogStoreOptions,
-): RunLogStore {
+export function createDurableRunLogStore(options: DurableRunLogStoreOptions): RunLogStore {
+  const { basePath, s3 } = options;
+  const s3Reader = options.s3Reader;
+  const s3Prefix = normalizeKeyPrefix(s3?.keyPrefix);
+  const inflightMirrorMs = s3?.inflightMirrorMs && s3.inflightMirrorMs > 0 ? s3.inflightMirrorMs : 0;
+
+  function s3Key(logRef: string): string {
+    return s3Prefix ? `${s3Prefix}/${logRef}` : logRef;
+  }
+
+  interface InflightMirrorEntry {
+    dirty: boolean;
+    lastMirrorAt: number;
+    timer: NodeJS.Timeout | null;
+    upload: Promise<boolean> | null;
+  }
+  const inflightMirrors = new Map<string, InflightMirrorEntry>();
+
+  function mirrorInflightNow(logRef: string, entry: InflightMirrorEntry): Promise<boolean> {
+    entry.dirty = false;
+    const upload = (async () => {
+      const absPath = resolveWithin(basePath, logRef);
+      const stat = await fs.stat(absPath);
+      if (stat.size === 0) return true;
+      await s3!.provider.putObject({
+        objectKey: s3Key(logRef),
+        body: createReadStream(absPath, { start: 0, end: stat.size - 1 }),
+        contentType: "application/x-ndjson",
+        contentLength: stat.size,
+      });
+      return true;
+    })().catch((err) => {
+      logger.warn({ err, objectKey: s3Key(logRef) }, "run-log: failed to mirror in-flight log");
+      entry.dirty = true;
+      return false;
+    }).finally(() => {
+      entry.lastMirrorAt = Date.now();
+      entry.upload = null;
+      if (entry.dirty) scheduleInflightMirror(logRef, entry);
+    });
+    entry.upload = upload;
+    return upload;
+  }
+
+  function scheduleInflightMirror(logRef: string, entry: InflightMirrorEntry): void {
+    if (inflightMirrors.get(logRef) !== entry || entry.timer || entry.upload) return;
+    const delay = Math.max(0, inflightMirrorMs - (Date.now() - entry.lastMirrorAt));
+    entry.timer = setTimeout(() => {
+      entry.timer = null;
+      void mirrorInflightNow(logRef, entry);
+    }, delay);
+    entry.timer.unref?.();
+  }
+
+  function noteInflightAppend(logRef: string): void {
+    if (!s3 || inflightMirrorMs <= 0) return;
+    let entry = inflightMirrors.get(logRef);
+    if (!entry) {
+      entry = { dirty: false, lastMirrorAt: Date.now(), timer: null, upload: null };
+      inflightMirrors.set(logRef, entry);
+    }
+    entry.dirty = true;
+    scheduleInflightMirror(logRef, entry);
+  }
+
+  async function retireInflightMirror(logRef: string): Promise<void> {
+    const entry = inflightMirrors.get(logRef);
+    if (!entry) return;
+    inflightMirrors.delete(logRef);
+    if (entry.timer) {
+      clearTimeout(entry.timer);
+      entry.timer = null;
+    }
+    if (entry.upload) await entry.upload;
+  }
+
   // logRef -> cap-tracking state. Cleared in finalize(); reseeded from disk
   // (fs.stat) the first time an unknown logRef is appended to, so a server
   // restart mid-run doesn't lose the running total.
   const capState = new Map<string, RunLogCapState>();
-  // logRefs whose finalize() has begun. A finalized ref's raw `.ndjson` is
-  // gzipped and unlinked, so a late append() must NOT recreate/write it (that
-  // would strand invisible bytes: read() resolves the `.gz` first). Runtime
-  // services can still emit onLog appends after heartbeat calls finalize()
-  // (heartbeat releases runtime services only after finalizing), so we guard
-  // append() against it here.
-  //
-  // Accepted limitation: this Set lives only in-process. After a server restart
-  // it is empty, so a zombie appender could recreate a raw file for an
-  // already-finalized run. That raw file stays invisible (read() prefers the
-  // .gz) and is bounded by the infra janitor backstop — deliberate.
-  const finalizedRefs = new Set<string>();
-  // Refs we've already warned about appending-after-finalize, so the warn is
-  // emitted once per ref, not once per dropped chunk.
-  const appendAfterFinalizeWarned = new Set<string>();
+  // Close append admission per handle at finalize, then drain accepted disk
+  // writes before hashing/compressing. A later retry can reuse the same logRef.
+  const closingHandles = new WeakSet<RunLogHandle>();
+  const pendingAppends = new WeakMap<RunLogHandle, Set<Promise<void>>>();
+  const appendAfterFinalizeWarned = new WeakSet<RunLogHandle>();
 
   async function ensureDir(relativeDir: string) {
     const dir = resolveWithin(basePath, relativeDir);
@@ -359,7 +459,8 @@ export function createLocalFileRunLogStore(
     return seeded;
   }
 
-  async function readFileRange(filePath: string, offset: number, limitBytes: number): Promise<RunLogReadResult> {
+  async function readFileRange(filePath: string, offset: number, limitBytes: number, signal?: AbortSignal): Promise<RunLogReadResult> {
+    signal?.throwIfAborted();
     const stat = await fs.stat(filePath).catch(() => null);
     if (!stat) throw notFound("Run log not found");
 
@@ -372,7 +473,7 @@ export function createLocalFileRunLogStore(
 
     const chunks: Buffer[] = [];
     await new Promise<void>((resolve, reject) => {
-      const stream = createReadStream(filePath, { start, end });
+      const stream = attachAbortSignal(createReadStream(filePath, { start, end }), signal);
       stream.on("data", (chunk) => {
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       });
@@ -385,15 +486,46 @@ export function createLocalFileRunLogStore(
     return { content, nextOffset };
   }
 
+  async function readS3Range(
+    logRef: string,
+    offset: number,
+    limitBytes: number,
+    signal?: AbortSignal,
+  ): Promise<RunLogReadResult> {
+    signal?.throwIfAborted();
+    if (!s3) throw notFound("Run log not found");
+    const objectKey = s3Key(logRef);
+    const head = await s3.provider.headObject({ objectKey, signal });
+    signal?.throwIfAborted();
+    if (!head.exists) throw notFound("Run log not found");
+
+    const total = head.contentLength ?? 0;
+    const start = Math.max(0, Math.min(offset, total));
+    const end = Math.min(start + limitBytes - 1, total - 1);
+    if (total === 0 || start > end) return { content: "", nextOffset: start < total ? start : undefined };
+
+    const result = await s3.provider.getObject({ objectKey, range: { start, end }, signal });
+    signal?.throwIfAborted();
+    const stream = attachAbortSignal(result.stream, signal);
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    signal?.throwIfAborted();
+    const content = Buffer.concat(chunks).toString("utf8");
+    return { content, nextOffset: end + 1 < total ? end + 1 : undefined };
+  }
+
   /**
    * Range-read a gzip-compressed log file. offset/limitBytes semantics are over
    * the UNCOMPRESSED byte stream (identical to readFileRange). Delegates to the
    * shared `readGunzipRange`, which the S3 read path also reuses.
    */
-  async function readGzipRange(filePath: string, offset: number, limitBytes: number): Promise<RunLogReadResult> {
+  async function readGzipRange(filePath: string, offset: number, limitBytes: number, signal?: AbortSignal): Promise<RunLogReadResult> {
+    signal?.throwIfAborted();
     const exists = await fs.stat(filePath).catch(() => null);
     if (!exists) throw notFound("Run log not found");
-    return readGunzipRange(createReadStream(filePath), offset, limitBytes);
+    return readGunzipRange(attachAbortSignal(createReadStream(filePath), signal), offset, limitBytes);
   }
 
   /**
@@ -402,9 +534,9 @@ export function createLocalFileRunLogStore(
    *  - exact path if present
    *  - `.ndjson` ref → try `.ndjson.gz` (legacy rows + the compress crash window)
    *  - `.ndjson.gz` ref → try raw `.ndjson` (gzip-failure fallback)
-   * Step 3 will extend this with an S3 fallback.
+   * Returns null when no local copy exists so the durable reader can try S3.
    */
-  async function resolveReadTarget(logRef: string): Promise<{ absPath: string; compressed: boolean }> {
+  async function resolveReadTarget(logRef: string): Promise<{ absPath: string; compressed: boolean } | null> {
     const absPath = resolveWithin(basePath, logRef);
     if (await fs.stat(absPath).catch(() => null)) {
       return { absPath, compressed: logRef.endsWith(".gz") };
@@ -424,7 +556,7 @@ export function createLocalFileRunLogStore(
       }
     }
 
-    throw notFound("Run log not found");
+    return null;
   }
 
   return {
@@ -436,67 +568,116 @@ export function createLocalFileRunLogStore(
       await ensureDir(relDir);
 
       const absPath = resolveWithin(basePath, relPath);
-      await fs.writeFile(absPath, "", "utf8");
-
-      return { store: "local_file", logRef: relPath };
+      await retireInflightMirror(relPath);
+      const rawExists = await fs.stat(absPath).then(() => true, () => false);
+      const gzPath = `${absPath}.gz`;
+      if (!rawExists && await fs.stat(gzPath).catch(() => null)) {
+        // A retry may reopen a previously finalized run. Restore the compressed
+        // prefix before appending so every attempt remains in chronological order.
+        await gunzipFileToRaw(gzPath, absPath);
+      } else if (!rawExists && s3) {
+        const head = await s3.provider.headObject({ objectKey: s3Key(relPath) });
+        if (head.exists) {
+          const temporary = `${absPath}.${randomUUID()}.restore`;
+          try {
+            const object = await s3.provider.getObject({ objectKey: s3Key(relPath) });
+            await pipeline(object.stream, createWriteStream(temporary, { flags: "wx", mode: 0o600 }));
+            if (typeof head.contentLength === "number" && (await fs.stat(temporary)).size !== head.contentLength) {
+              throw new Error("Durable run log restore returned an incomplete prefix");
+            }
+            await fs.link(temporary, absPath).catch((err: NodeJS.ErrnoException) => {
+              if (err.code !== "EEXIST") throw err;
+            });
+          } finally {
+            await fs.rm(temporary, { force: true });
+          }
+        }
+      }
+      const file = await fs.open(absPath, "a", 0o600);
+      await file.close();
+      return { store: "local_file", logRef: relPath, attemptId: randomUUID() };
     },
 
     async append(handle, event) {
       if (handle.store !== "local_file") return 0;
-      if (finalizedRefs.has(handle.logRef)) {
-        if (!appendAfterFinalizeWarned.has(handle.logRef)) {
-          appendAfterFinalizeWarned.add(handle.logRef);
-          logger.warn(
-            { logRef: handle.logRef },
-            "run-log: append after finalize ignored; log is already compressed/sealed",
-          );
+      if (closingHandles.has(handle)) {
+        if (!appendAfterFinalizeWarned.has(handle)) {
+          appendAfterFinalizeWarned.add(handle);
+          logger.warn({ logRef: handle.logRef }, "run-log: append after finalize ignored");
         }
         return 0;
       }
-      const absPath = resolveWithin(basePath, handle.logRef);
-      const state = await getCapState(handle.logRef, absPath);
 
-      if (state.truncated) return 0;
+      const operation = (async () => {
+        const absPath = resolveWithin(basePath, handle.logRef);
+        const state = await getCapState(handle.logRef, absPath);
+        if (state.truncated) return 0;
 
-      const line = JSON.stringify({
-        ts: event.ts,
-        stream: event.stream,
-        chunk: event.chunk,
-        // Monotonic per-run sequence so readers can dedupe and order records
-        // even when several identical chunks share the same millisecond ts
-        // (common for ACP-style token deltas).
-        ...(typeof event.seq === "number" && Number.isFinite(event.seq) ? { seq: event.seq } : {}),
-      });
-      const persisted = `${line}\n`;
-      const persistedBytes = Buffer.byteLength(persisted, "utf8");
-      const capBytes = runLogMaxBytes();
-
-      if (state.writtenBytes + persistedBytes > capBytes) {
-        state.truncated = true;
-        const markerLine = JSON.stringify({
+        const line = JSON.stringify({
           ts: event.ts,
-          stream: RUN_LOG_TRUNCATION_STREAM,
-          chunk: `[run-log truncated: size cap ${capBytes} bytes reached; further output dropped]`,
+          ...(handle.attemptId ? { attemptId: handle.attemptId } : {}),
+          stream: event.stream,
+          chunk: event.chunk,
+          ...(typeof event.seq === "number" && Number.isFinite(event.seq) ? { seq: event.seq } : {}),
         });
-        const markerPersisted = `${markerLine}\n`;
-        await fs.appendFile(absPath, markerPersisted, "utf8");
-        state.writtenBytes += Buffer.byteLength(markerPersisted, "utf8");
-        return 0;
-      }
+        const persisted = `${line}\n`;
+        const persistedBytes = Buffer.byteLength(persisted, "utf8");
+        const capBytes = runLogMaxBytes();
 
-      await fs.appendFile(absPath, persisted, "utf8");
-      state.writtenBytes += persistedBytes;
-      return persistedBytes;
+        if (state.writtenBytes + persistedBytes > capBytes) {
+          state.truncated = true;
+          const marker = `${JSON.stringify({
+            ts: event.ts,
+            stream: RUN_LOG_TRUNCATION_STREAM,
+            chunk: `[run-log truncated: size cap ${capBytes} bytes reached; further output dropped]`,
+          })}\n`;
+          await fs.appendFile(absPath, marker, "utf8");
+          state.writtenBytes += Buffer.byteLength(marker, "utf8");
+          if (!closingHandles.has(handle)) noteInflightAppend(handle.logRef);
+          return 0;
+        }
+
+        await fs.appendFile(absPath, persisted, "utf8");
+        state.writtenBytes += persistedBytes;
+        if (!closingHandles.has(handle)) noteInflightAppend(handle.logRef);
+        return persistedBytes;
+      })();
+      let pending = pendingAppends.get(handle);
+      if (!pending) {
+        pending = new Set();
+        pendingAppends.set(handle, pending);
+      }
+      const settled = operation.then(() => undefined, () => undefined);
+      pending.add(settled);
+      try {
+        return await operation;
+      } finally {
+        pending.delete(settled);
+      }
     },
 
     async finalize(handle) {
-      // Mark finalized at the START (before gzip/unlink) so any append() racing
-      // the compression is dropped rather than recreating the raw file.
-      finalizedRefs.add(handle.logRef);
-      capState.delete(handle.logRef);
+      closingHandles.add(handle);
       if (handle.store !== "local_file") {
         return { bytes: 0, compressed: false, logRef: handle.logRef };
       }
+      const pending = pendingAppends.get(handle);
+      if (pending?.size) {
+        let timer: NodeJS.Timeout | undefined;
+        const drained = await Promise.race([
+          Promise.all([...pending]).then(() => true),
+          new Promise<boolean>((resolve) => {
+            timer = setTimeout(() => resolve(false), 5_000);
+          }),
+        ]);
+        if (timer) clearTimeout(timer);
+        if (!drained) {
+          void retireInflightMirror(handle.logRef).catch(() => undefined);
+          return { bytes: null, sha256: null, compressed: false, logRef: handle.logRef };
+        }
+      }
+      await retireInflightMirror(handle.logRef);
+      capState.delete(handle.logRef);
       const absPath = resolveWithin(basePath, handle.logRef);
       const stat = await fs.stat(absPath).catch(() => null);
       if (!stat) throw notFound("Run log not found");
@@ -504,6 +685,19 @@ export function createLocalFileRunLogStore(
       // bytes/sha256 always describe the ORIGINAL uncompressed content.
       const rawBytes = stat.size;
       const rawSha256 = await sha256File(absPath);
+
+      if (s3) {
+        try {
+          await s3.provider.putObject({
+            objectKey: s3Key(handle.logRef),
+            body: createReadStream(absPath),
+            contentType: "application/x-ndjson",
+            contentLength: stat.size,
+          });
+        } catch (err) {
+          logger.warn({ err, objectKey: s3Key(handle.logRef) }, "run-log: failed to mirror finalized log");
+        }
+      }
 
       const uncompressedSummary: RunLogFinalizeSummary = {
         bytes: rawBytes,
@@ -548,32 +742,90 @@ export function createLocalFileRunLogStore(
     },
 
     async read(handle, opts) {
+      opts?.signal?.throwIfAborted();
       const offset = opts?.offset ?? 0;
       const limitBytes = opts?.limitBytes ?? 256_000;
 
-      // Cold tier: stream the archived object, gunzip, and apply the SAME
-      // uncompressed offset/limitBytes semantics as the hot gz path. logRef is
-      // the full S3 object key, so no company scoping is needed here.
+      // Cold archive handles contain gzip data and retain the fork's full-key
+      // lookup. The durable mirror below stores plain ndjson under the run ref.
       if (handle.store === "s3") {
-        const reader = options?.s3Reader;
-        if (!reader) throw notFound("Run log not found");
-        const { stream } = await reader.getObject({ objectKey: handle.logRef });
-        return readGunzipRange(stream, offset, limitBytes);
+        if (!s3Reader) throw notFound("Run log not found");
+        const { stream } = await s3Reader.getObject({ objectKey: handle.logRef, signal: opts?.signal });
+        opts?.signal?.throwIfAborted();
+        return readGunzipRange(attachAbortSignal(stream, opts?.signal), offset, limitBytes);
       }
 
-      if (handle.store === "missing") {
-        // Hot copy is gone and there is no cold archive to fall back to.
-        throw notFound("Run log not found");
-      }
+      if (handle.store === "missing") throw notFound("Run log not found");
+      if (handle.store !== "local_file") throw notFound("Run log not found");
 
-      if (handle.store !== "local_file") {
-        throw notFound("Run log not found");
+      const target = await resolveReadTarget(handle.logRef);
+      if (target) {
+        return target.compressed
+          ? readGzipRange(target.absPath, offset, limitBytes, opts?.signal)
+          : readFileRange(target.absPath, offset, limitBytes, opts?.signal);
       }
-      const { absPath, compressed } = await resolveReadTarget(handle.logRef);
-      return compressed
-        ? readGzipRange(absPath, offset, limitBytes)
-        : readFileRange(absPath, offset, limitBytes);
+      if (!s3) throw notFound("Run log not found");
+      // Finalized local logs may point at .ndjson.gz, while the transparent
+      // durable mirror remains the original uncompressed .ndjson object.
+      const rawRef = handle.logRef.endsWith(".ndjson.gz")
+        ? handle.logRef.slice(0, -".gz".length)
+        : handle.logRef;
+      return readS3Range(rawRef, offset, limitBytes, opts?.signal);
     },
+
+    async flushInflightMirrors() {
+      if (!s3 || inflightMirrorMs <= 0) return;
+      const flushEntry = async (logRef: string, entry: InflightMirrorEntry) => {
+        for (;;) {
+          if (entry.timer) {
+            clearTimeout(entry.timer);
+            entry.timer = null;
+          }
+          if (entry.upload) {
+            await entry.upload;
+            continue;
+          }
+          if (!entry.dirty) return;
+          const uploaded = await mirrorInflightNow(logRef, entry);
+          if (!uploaded) {
+            if (entry.timer) {
+              clearTimeout(entry.timer);
+              entry.timer = null;
+            }
+            return;
+          }
+        }
+      };
+      await Promise.all([...inflightMirrors].map(([logRef, entry]) => flushEntry(logRef, entry)));
+    },
+  };
+}
+
+/** Backward-compatible constructor name for fork callers and existing fixtures. */
+export function createLocalFileRunLogStore(
+  basePath: string,
+  options?: CreateRunLogStoreOptions,
+): RunLogStore {
+  return createDurableRunLogStore({ basePath, ...options });
+}
+
+function resolveRunLogS3(): DurableRunLogStoreOptions["s3"] {
+  const bucket = process.env.RUN_LOG_S3_BUCKET?.trim();
+  if (!bucket) return undefined;
+  const provider = createS3StorageProvider({
+    bucket,
+    region: process.env.RUN_LOG_S3_REGION?.trim() || "us-east-1",
+    endpoint: process.env.RUN_LOG_S3_ENDPOINT?.trim() || undefined,
+    forcePathStyle: process.env.RUN_LOG_S3_FORCE_PATH_STYLE
+      ? process.env.RUN_LOG_S3_FORCE_PATH_STYLE === "true"
+      : true,
+  });
+  const inflightSeconds = Number.parseFloat(process.env.RUN_LOG_S3_INFLIGHT_MIRROR_SECONDS ?? "");
+  return {
+    provider,
+    keyPrefix: process.env.RUN_LOG_S3_PREFIX?.trim() || "run-logs",
+    inflightMirrorMs:
+      Number.isFinite(inflightSeconds) && inflightSeconds > 0 ? Math.round(inflightSeconds * 1000) : undefined,
   };
 }
 
@@ -585,24 +837,25 @@ export function getRunLogStore() {
   // s3Reader defers provider resolution to read time, so a local_disk-only
   // instance never eagerly builds an S3 client, and archived (s3-tier) runs are
   // still transparently readable when object storage is configured.
-  cachedStore = createLocalFileRunLogStore(basePath, {
+  cachedStore = createDurableRunLogStore({
+    basePath,
+    s3: resolveRunLogS3(),
     s3Reader: {
       async getObject(input) {
         const objectStore = getRunLogArchiveObjectStore();
         const metadata = await objectStore?.find(input.objectKey);
         if (objectStore?.shared) {
           if (!metadata) throw notFound("Run log not found");
-          return { stream: await objectStore.get(metadata) };
+          const stream = await objectStore.get(metadata);
+          return { stream: attachAbortSignal(stream, input.signal) };
         }
-        return getRunLogArchiveStorageProvider().getObject({ objectKey: input.objectKey });
+        return getRunLogArchiveStorageProvider().getObject({ objectKey: input.objectKey, signal: input.signal });
       },
     },
   });
   return cachedStore;
 }
 
-// Upstream compat (v2026.817.0): upstream's durable store mirrors in-flight
-// logs to S3 and flushes them on graceful shutdown. The fork store instead
-// cold-archives finalized logs via run-log-archiver, so there is nothing to
-// flush; keep the export as a no-op so shared shutdown wiring compiles.
-export async function flushInFlightRunLogMirrors(): Promise<void> {}
+export async function flushInFlightRunLogMirrors(): Promise<void> {
+  await cachedStore?.flushInflightMirrors?.();
+}

@@ -50,6 +50,17 @@ import { heartbeatRuns } from "@paperclipai/db";
 
 export const DEFAULT_LEASE_TTL_MS = 90_000;
 
+/**
+ * A bound-parameter millisecond interval. Replaces string interpolation into
+ * `'<n> milliseconds'` casts: the value travels as an integer parameter and the
+ * server multiplies a fixed `interval '1 millisecond'`, so nothing is spliced
+ * into the SQL text and non-integer or negative input is normalised here.
+ */
+export function sqlMillisInterval(ms: number) {
+  const whole = Number.isFinite(ms) ? Math.max(0, Math.trunc(ms)) : 0;
+  return sql`(${whole}::bigint * interval '1 millisecond')`;
+}
+
 export function mintOwnerToken(): string {
   return randomUUID();
 }
@@ -171,14 +182,14 @@ export async function claimExpiredLease(
     UPDATE heartbeat_runs
     SET owner_token = ${ownerToken},
         fence = nextval('heartbeat_run_fence_seq'),
-        lease_expires_at = now() + (${leaseTtlMs}::text || ' milliseconds')::interval,
+        lease_expires_at = now() + ${sqlMillisInterval(leaseTtlMs)},
         lease_renewed_at = now(),
         claim_attempt = claim_attempt + 1,
         updated_at = now()
     WHERE id = ${input.runId}
       AND status = 'running'
       AND lease_expires_at is not null
-      AND lease_expires_at < now() - (${graceMs}::text || ' milliseconds')::interval
+      AND lease_expires_at < now() - ${sqlMillisInterval(graceMs)}
     RETURNING *
   `)) as unknown as Array<Record<string, unknown>>;
   return rows[0] ? normalizeHeartbeatRunRow(rows[0]) : null;
@@ -205,7 +216,7 @@ export async function findExpiredLeaseRuns(
       and(
         eq(heartbeatRuns.status, "running"),
         sql`${heartbeatRuns.leaseExpiresAt} is not null`,
-        lt(heartbeatRuns.leaseExpiresAt, sql`now() - (${graceMs}::text || ' milliseconds')::interval`),
+        lt(heartbeatRuns.leaseExpiresAt, sql`now() - ${sqlMillisInterval(graceMs)}`),
       ),
     )
     .orderBy(asc(heartbeatRuns.leaseExpiresAt))
@@ -250,7 +261,7 @@ export async function appendFencedRunEvent(
   const rows = (await db.execute(sql`
     WITH lease AS (
       UPDATE heartbeat_runs
-      SET lease_expires_at = now() + (${leaseTtlMs}::text || ' milliseconds')::interval,
+      SET lease_expires_at = now() + ${sqlMillisInterval(leaseTtlMs)},
           lease_renewed_at = now(),
           updated_at = now()
       WHERE id = ${input.runId}
@@ -300,7 +311,7 @@ export async function writeFencedRunPatch(
     .update(heartbeatRuns)
     .set({
       ...input.patch,
-      leaseExpiresAt: sql`now() + (${leaseTtlMs}::text || ' milliseconds')::interval`,
+      leaseExpiresAt: sql`now() + ${sqlMillisInterval(leaseTtlMs)}`,
       leaseRenewedAt: sql`now()`,
       updatedAt: sql`now()`,
     })

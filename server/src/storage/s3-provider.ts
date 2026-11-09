@@ -5,7 +5,8 @@ import {
   HeadObjectCommand,
   PutObjectCommand,
 } from "@aws-sdk/client-s3";
-import { Readable } from "node:stream";
+import { putS3Multipart } from "./s3-multipart.js";
+import { addAbortSignal, Readable } from "node:stream";
 import type { StorageProvider, GetObjectResult, HeadObjectResult } from "./types.js";
 import { conflict, notFound, unprocessable } from "../errors.js";
 
@@ -83,6 +84,10 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
 
     async putObject(input) {
       const key = buildKey(prefix, input.objectKey);
+      if (input.contentLength > 16 * 1024 * 1024 && !input.ifNoneMatch) {
+        await putS3Multipart(client, bucket, key, input);
+        return { checksumSha256: input.checksumSha256 };
+      }
       try {
         const output = await client.send(
           new PutObjectCommand({
@@ -103,9 +108,7 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
       } catch (err) {
         const code = (err as { name?: string; $metadata?: { httpStatusCode?: number } }).name;
         const status = (err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
-        if (input.ifNoneMatch && (code === "PreconditionFailed" || status === 412)) {
-          throw conflict("Object already exists");
-        }
+        if (input.ifNoneMatch && (code === "PreconditionFailed" || status === 412)) throw conflict("Object already exists");
         throw err;
       }
     },
@@ -120,10 +123,13 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
             VersionId: input.version,
             Range: input.range ? `bytes=${input.range.start}-${input.range.end}` : undefined,
           }),
+          { abortSignal: input.signal },
         );
 
+        const stream = await toReadableStream(output.Body);
+        if (input.signal) addAbortSignal(input.signal, stream);
         return {
-          stream: await toReadableStream(output.Body),
+          stream,
           contentType: output.ContentType,
           contentLength: output.ContentLength,
           etag: output.ETag,
@@ -148,6 +154,7 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
             VersionId: input.version,
             ChecksumMode: "ENABLED",
           }),
+          { abortSignal: input.signal },
         );
 
         return {

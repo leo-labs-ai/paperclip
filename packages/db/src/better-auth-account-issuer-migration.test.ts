@@ -21,7 +21,7 @@ import {
 
 const MIGRATION_FILES = [
   "0237_better_auth_account_issuer.sql",
-  "0287_better_auth_account_issuer_nullable.sql",
+  "0382_better_auth_account_issuer_nullable.sql",
 ];
 const UNIQUE_INDEX = "account_issuer_account_id_uq";
 

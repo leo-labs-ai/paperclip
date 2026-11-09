@@ -86,13 +86,101 @@ type SlotAdmissionInput = {
   dailyRunLimit?: number | null;
 };
 
+type SlotAdmissionDecision =
+  | { admitted: true }
+  | { admitted: false; dailyCapBlock: DailyRunCapBlock | null };
+
+/**
+ * Admission checks that must run inside the SAME transaction as the queued ->
+ * running UPDATE: the per-agent advisory lock, the strict daily-run cap and the
+ * concurrency cap. Callers that already own a claim transaction (the queue's
+ * claim, the native review claim) call this immediately before their UPDATE
+ * instead of opening a nested transaction, so the lock, the cap reads and the
+ * ownership-minting UPDATE commit or roll back together. Separate Paperclip
+ * workers serialize on the advisory lock, so the caps stay strict across
+ * replicas and restarts.
+ *
+ * `maxConcurrentRuns` is supplied by the caller so the scheduler's own policy
+ * resolution (including per-role concurrency overrides) stays the single source
+ * of truth; it falls back to the shared heartbeat policy when omitted.
+ */
+/**
+ * Take the per-agent slot lock for the rest of the transaction.
+ *
+ * LOCK ORDER (every admission path, no exceptions): this slot lock is the
+ * FIRST lock a claim transaction takes. The order is
+ *   slot advisory (this) < issue row < wakeup row < run row < external-admission advisory.
+ * A transaction that already holds issue/wake/run row locks must never wait
+ * for this lock, because the lock holder next waits for those rows. The lock
+ * is re-entrant within a transaction, so `admitRunSlotInTransaction` calling it
+ * again after the early acquire is a no-op.
+ */
+export async function acquireRunSlotLock(txDb: Db, agentId: string): Promise<void> {
+  await txDb.execute(
+    sql`select pg_advisory_xact_lock(hashtextextended(${`heartbeat-run-slot:${agentId}`}, 0))`,
+  );
+}
+
+export async function admitRunSlotInTransaction(
+  txDb: Db,
+  input: SlotAdmissionInput & { maxConcurrentRuns?: number },
+): Promise<SlotAdmissionDecision> {
+  await acquireRunSlotLock(txDb, input.agentId);
+
+  let maxConcurrentRuns = input.maxConcurrentRuns;
+  if (maxConcurrentRuns === undefined) {
+    const agent = await txDb
+      .select()
+      .from(agents)
+      .where(eq(agents.id, input.agentId))
+      .then((rows) => rows[0] ?? null);
+    if (!agent) return { admitted: false, dailyCapBlock: null };
+    maxConcurrentRuns = parseHeartbeatPolicy(agent).maxConcurrentRuns;
+  }
+
+  if (input.dailyRunLimit !== null && input.dailyRunLimit !== undefined) {
+    const { start, end } = currentUtcDayWindow(new Date());
+    const [row] = await txDb
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, input.agentId),
+          gte(heartbeatRuns.startedAt, start),
+          lt(heartbeatRuns.startedAt, end),
+          notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+          ne(heartbeatRuns.id, input.runId),
+        ),
+      );
+    const observed = Number(row?.count ?? 0);
+    if (observed >= input.dailyRunLimit) {
+      return {
+        admitted: false,
+        dailyCapBlock: {
+          reason: "heartbeat.daily_run_limit",
+          observed,
+          limit: input.dailyRunLimit,
+        },
+      };
+    }
+  }
+
+  const [{ count }] = await txDb
+    .select({ count: sql<number>`count(*)` })
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.status, "running")));
+  if (Number(count ?? 0) >= maxConcurrentRuns) {
+    return { admitted: false, dailyCapBlock: null };
+  }
+  return { admitted: true };
+}
+
 /**
  * Run `claimWrite` inside a transaction that holds the per-agent advisory
  * lock and has verified the daily-run cap and the concurrency cap. The
  * callback performs the actual queued -> running UPDATE (which may carry
  * caller-specific bookkeeping) and returns the claimed row or null when the
- * compare-and-set lost. Separate Paperclip workers serialize on the advisory
- * lock, so the caps remain strict across replicas and restarts.
+ * compare-and-set lost.
  */
 export async function withHeartbeatRunSlotAdmission(
   db: Db,
@@ -101,52 +189,8 @@ export async function withHeartbeatRunSlotAdmission(
 ): Promise<HeartbeatRunSlotClaim> {
   return db.transaction(async (tx) => {
     const txDb = tx as unknown as Db;
-    await txDb.execute(
-      sql`select pg_advisory_xact_lock(hashtextextended(${`heartbeat-run-slot:${input.agentId}`}, 0))`,
-    );
-
-    const agent = await txDb
-      .select()
-      .from(agents)
-      .where(eq(agents.id, input.agentId))
-      .then((rows) => rows[0] ?? null);
-    if (!agent) return { claimed: null, dailyCapBlock: null };
-
-    if (input.dailyRunLimit !== null && input.dailyRunLimit !== undefined) {
-      const { start, end } = currentUtcDayWindow(new Date());
-      const [row] = await txDb
-        .select({ count: sql<number>`count(*)` })
-        .from(heartbeatRuns)
-        .where(
-          and(
-            eq(heartbeatRuns.agentId, input.agentId),
-            gte(heartbeatRuns.startedAt, start),
-            lt(heartbeatRuns.startedAt, end),
-            notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
-            ne(heartbeatRuns.id, input.runId),
-          ),
-        );
-      const observed = Number(row?.count ?? 0);
-      if (observed >= input.dailyRunLimit) {
-        return {
-          claimed: null,
-          dailyCapBlock: {
-            reason: "heartbeat.daily_run_limit",
-            observed,
-            limit: input.dailyRunLimit,
-          },
-        };
-      }
-    }
-
-    const [{ count }] = await txDb
-      .select({ count: sql<number>`count(*)` })
-      .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.status, "running")));
-    if (Number(count ?? 0) >= parseHeartbeatPolicy(agent).maxConcurrentRuns) {
-      return { claimed: null, dailyCapBlock: null };
-    }
-
+    const decision = await admitRunSlotInTransaction(txDb, input);
+    if (!decision.admitted) return { claimed: null, dailyCapBlock: decision.dailyCapBlock };
     const claimed = await claimWrite(txDb);
     return { claimed, dailyCapBlock: null };
   });

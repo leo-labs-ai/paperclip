@@ -434,16 +434,13 @@ export function findClosePiModelMatches(
 
 /**
  * Error text for a model that Pi (and therefore ClawRouter) cannot resolve.
- * Lists close matches first, then every available model; the old message
- * showed only the first 12 ids alphabetically, which usually hid the model the
- * operator meant.
+ * Suggest close matches without copying the full model catalogue into logs.
  */
 export function formatPiModelUnavailableMessage(model: string, models: AdapterModel[]): string {
-  const ids = models.map((entry) => entry.id);
   const close = findClosePiModelMatches(model, models);
   const parts = [`Configured Pi model is unavailable: ${model}.`];
   if (close.length > 0) parts.push(`Did you mean: ${close.join(", ")}?`);
-  parts.push(`Available models (${ids.length}): ${ids.join(", ")}`);
+  parts.push(`${models.length} models are available; list them with \`pi --list-models\`.`);
   return parts.join(" ");
 }
 

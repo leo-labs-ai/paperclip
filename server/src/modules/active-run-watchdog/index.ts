@@ -25,6 +25,7 @@ export function createActiveRunWatchdog(db: Db, config: ActiveRunWatchdogConfig)
   const processController = createProcessAdapter();
 
   const foldSourceResolvedRun = createFoldSourceResolvedRun({
+    reader: postgresAdapter,
     writer: postgresAdapter,
     processController,
   });

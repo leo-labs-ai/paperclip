@@ -1,8 +1,8 @@
-import { and, asc, eq, or, sql } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import { nativeSha256 } from "./native-runtime/canonical.js";
-import { DEFAULT_LEASE_TTL_MS, type RunClaim } from "./run-ownership-store.js";
+import { DEFAULT_LEASE_TTL_MS, sqlMillisInterval, type RunClaim } from "./run-ownership-store.js";
 
 export interface AppendHeartbeatRunEventInput {
   companyId: string;
@@ -88,6 +88,71 @@ export async function appendHeartbeatRunEvent(
   db: Db,
   input: AppendHeartbeatRunEventInput,
 ): Promise<AppendHeartbeatRunEventResult> {
+  if (!input.nativeSource && !input.retryExhaustion) {
+    // Fork: a claimed append must land only while the run row still carries
+    // exactly this (ownerToken, fence) pair and is running. The ownership
+    // predicate lives in the same UPDATE that allocates the sequence, so a
+    // takeover committing between "check" and "insert" cannot admit a stale
+    // executor's event, and the lease renews in that same statement.
+    const claim = input.claim ?? null;
+    const claimPredicate = claim
+      ? sql`and ${heartbeatRuns.status} = 'running'
+        and ${heartbeatRuns.ownerToken} = ${claim.ownerToken}
+        and ${claim.fence === null ? sql`${heartbeatRuns.fence} is null` : sql`${heartbeatRuns.fence} = ${claim.fence}`}`
+      : sql``;
+    const leaseRenewal = claim
+      ? sql`, lease_expires_at = now() + ${sqlMillisInterval(input.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS)},
+          lease_renewed_at = now()`
+      : sql``;
+    const allocated = db.$with("allocated_run_event", {}).as(sql`
+      update ${heartbeatRuns}
+      set next_event_seq = greatest(${heartbeatRuns.nextEventSeq}, coalesce((
+            select max(${heartbeatRunEvents.seq}) + 1 from ${heartbeatRunEvents}
+            where ${heartbeatRunEvents.runId} = ${input.runId}
+          ), 1)) + 1,
+          updated_at = ${sql.param(new Date(), heartbeatRuns.updatedAt)}${leaseRenewal}
+      where ${heartbeatRuns.id} = ${input.runId}
+        and ${heartbeatRuns.companyId} = ${input.companyId}
+        and ${heartbeatRuns.agentId} = ${input.agentId}
+        ${claimPredicate}
+      returning company_id, id as run_id, agent_id, next_event_seq - 1 as seq, fence as event_fence
+    `);
+    const appended = db.$with("appended_run_event", getTableColumns(heartbeatRunEvents)).as(sql`
+      insert into ${heartbeatRunEvents}
+        (company_id, run_id, agent_id, seq, event_type, stream, level, color, message, payload, fence)
+      select company_id, run_id, agent_id, seq,
+        ${input.eventType}, ${input.stream ?? null}, ${input.level ?? null},
+        ${input.color ?? null}, ${input.message ?? null},
+        ${sql.param(input.payload ?? null, heartbeatRunEvents.payload)},
+        ${claim ? sql`event_fence` : sql`null`}
+      from ${allocated}
+      returning *
+    `);
+    const [row] = await db.with(allocated, appended).select().from(appended);
+    if (!row) {
+      if (claim) {
+        const [boundRun] = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.id, input.runId),
+              eq(heartbeatRuns.companyId, input.companyId),
+              eq(heartbeatRuns.agentId, input.agentId),
+            ),
+          )
+          .limit(1);
+        if (!boundRun) throw new Error("heartbeat_run_event_binding_mismatch");
+        return {
+          row: null as unknown as typeof heartbeatRunEvents.$inferSelect,
+          disposition: "rejected",
+          highestContiguousSourceSeq: 0,
+        };
+      }
+      throw new Error("heartbeat_run_event_binding_mismatch");
+    }
+    return { row, disposition: "committed", highestContiguousSourceSeq: 0 };
+  }
   return db.transaction(async (tx) => {
     const run = await tx
       .select()
@@ -120,7 +185,7 @@ export async function appendHeartbeatRunEvent(
       await tx
         .update(heartbeatRuns)
         .set({
-          leaseExpiresAt: sql`now() + (${leaseTtlMs}::text || ' milliseconds')::interval`,
+          leaseExpiresAt: sql`now() + ${sqlMillisInterval(leaseTtlMs)}`,
           leaseRenewedAt: sql`now()`,
         })
         .where(eq(heartbeatRuns.id, input.runId));

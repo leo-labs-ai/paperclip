@@ -1,3 +1,7 @@
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { beginRunPhase } from "./execution-preparation-timing.js";
+import type { ActivityPublication } from "../types/activity-publication.js";
+export type { ActivityPublication } from "../types/activity-publication.js";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -72,11 +76,6 @@ export interface LogActivityInput {
   responsibleUserIdOverride?: string | null;
 }
 
-export interface ActivityPublication {
-  companyId: string;
-  payload: Record<string, unknown>;
-  pluginEvent: PluginEvent | null;
-}
 
 export async function createActivityDetailsRedactor(db: Db) {
   const currentUserRedactionOptions = {
@@ -155,12 +154,18 @@ export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActi
 }
 
 export function publishActivity(publication: ActivityPublication) {
+  const finish = beginRunPhase("execution.realtime");
+  try {
   publishLiveEvent({
     companyId: publication.companyId,
     type: "activity.logged",
     payload: publication.payload,
   });
   if (publication.pluginEvent) publishPluginDomainEvent(publication.pluginEvent);
+  } catch (error) {
+    finish(true);
+    throw error;
+  } finally { finish(); }
 }
 
 export async function persistActivity(db: Db, input: LogActivityInput) {
@@ -178,29 +183,31 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
     responsibleUserId,
     details: redactedDetails,
   };
-  // Company scope is mandatory whenever a run id is written. Agent actors
-  // must also own that run. The lock and insert share a transaction so a
-  // delete or primary-key reuse cannot turn this write into a 500, and an
-  // earlier unlocked check is not treated as sufficient.
+  // Company scope and agent ownership must be checked under the run lock.
   const insertActivity = async (executor: Db) => {
+    if (input.entityType === "issue") {
+      await notifyDeliveryWork(executor, DELIVERY_QUEUES.mcpEvents, `task:${input.entityId}`);
+    }
     const [row] = await executor.insert(activityLog).values(values).returning({ id: activityLog.id });
     return row;
   };
   let activity: { id: string } | undefined;
   const runId = input.runId?.trim() || null;
-  if (runId) {
+  if (runId || input.entityType === "issue") {
     try {
       activity = await db.transaction(async (tx) => {
-        await lockScopedHeartbeatRun(tx, {
-          runId,
-          companyId: input.companyId,
-          agentId: input.actorType === "agent" && input.agentId ? input.agentId : null,
-        });
+        if (runId) {
+          await lockScopedHeartbeatRun(tx, {
+            runId,
+            companyId: input.companyId,
+            agentId: input.actorType === "agent" && input.agentId ? input.agentId : null,
+          });
+        }
         return insertActivity(tx as unknown as Db);
       });
     } catch (error) {
       if (error instanceof HttpError) throw error;
-      if (isHeartbeatRunReferenceViolation(error)) throw unknownRunIdError();
+      if (runId && isHeartbeatRunReferenceViolation(error)) throw unknownRunIdError();
       throw error;
     }
   } else {
@@ -208,6 +215,7 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
   }
 
   const payload = {
+    issueId: input.issueId ?? (input.entityType === "issue" ? input.entityId : null),
     actorType: input.actorType,
     actorId: input.actorId,
     action: input.action,

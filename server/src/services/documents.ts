@@ -4,6 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { documentRevisions, documents, issueDocuments, issues } from "@paperclipai/db";
 import { isSystemIssueDocumentKey, issueDocumentKeySchema } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { isUniqueViolation } from "../db-errors.js";
 import { insertRowsInChunks } from "./batch-insert.js";
 import type { ImportIssueDocumentRow } from "./import-write-types.js";
 
@@ -14,10 +15,6 @@ function normalizeDocumentKey(key: string) {
     throw unprocessable("Invalid document key", parsed.error.issues);
   }
   return parsed.data;
-}
-
-function isUniqueViolation(error: unknown): boolean {
-  return !!error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "23505";
 }
 
 function nextAvailableDocumentKey(sourceKey: string, existingKeys: string[]) {
@@ -188,6 +185,7 @@ export function documentService(db: Db) {
           changeSummary: documentRevisions.changeSummary,
           createdByAgentId: documentRevisions.createdByAgentId,
           createdByUserId: documentRevisions.createdByUserId,
+          createdByRunId: documentRevisions.createdByRunId,
           createdAt: documentRevisions.createdAt,
         })
         .from(issueDocuments)
@@ -502,7 +500,7 @@ export function documentService(db: Db) {
           };
           });
         } catch (error) {
-          if (isUniqueViolation(error)) {
+          if (isUniqueViolation(error, "issue_documents_company_issue_key_uq")) {
             if (input.lockedDocumentStrategy === "create_new_document" && attempt < maxAttempts - 1) {
               continue;
             }

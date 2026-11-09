@@ -95,6 +95,12 @@ describeEmbeddedPostgres("run ownership store", () => {
     return runId;
   }
 
+  async function expireLease(runId: string) {
+    await db2.update(heartbeatRuns)
+      .set({ leaseExpiresAt: new Date(Date.now() - 1_000_000) })
+      .where(eq(heartbeatRuns.id, runId));
+  }
+
   it("mints a unique, monotonic fence and owner token on claim", async () => {
     const { companyId, agentId } = await seedCompanyAgent();
     const runIds = [randomUUID(), randomUUID()];
@@ -304,7 +310,8 @@ describeEmbeddedPostgres("run ownership store", () => {
       expect(events[0]!.fence).toBe(claim.fence);
 
       // A peer takes over via db2, invalidating the original claim.
-      const takeover = await claimExpiredLease(db2, { runId, graceMs: -1_000_000 });
+      await expireLease(runId);
+      const takeover = await claimExpiredLease(db2, { runId });
       expect(takeover).toBeTruthy();
 
       const staleWrite = await appendFencedRunEvent(db, {
@@ -414,7 +421,8 @@ describeEmbeddedPostgres("run ownership store", () => {
       expect(patched!.leaseExpiresAt!.getTime()).toBeGreaterThan(claimed!.leaseExpiresAt!.getTime());
 
       // A peer takes over via db2, invalidating the original claim.
-      const takeover = await claimExpiredLease(db2, { runId, graceMs: -1_000_000 });
+      await expireLease(runId);
+      const takeover = await claimExpiredLease(db2, { runId });
       expect(takeover).toBeTruthy();
 
       const staleWrite = await writeFencedRunPatch(db, {
@@ -455,7 +463,8 @@ describeEmbeddedPostgres("run ownership store", () => {
 
       expect(await isClaimStale(db, { runId, claim })).toBe(false);
 
-      const takeover = await claimExpiredLease(db2, { runId, graceMs: -1_000_000 });
+      await expireLease(runId);
+      const takeover = await claimExpiredLease(db2, { runId });
       expect(takeover).toBeTruthy();
 
       expect(await isClaimStale(db, { runId, claim })).toBe(true);

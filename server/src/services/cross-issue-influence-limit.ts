@@ -109,13 +109,15 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
+    // An unscoped run (timer heartbeat with no checked-out issue) has no source
+    // issue, so every issue write it makes is cross-issue by definition and
+    // spends the cap. The locked run row above is the attribution anchor;
+    // rejecting these writes as run-less left live heartbeat runs unable to
+    // comment or update any task at all.
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
     if (!sourceIssueId) {
-      // Unassigned timer-wake heartbeats carry no source issue in their run
-      // context. Fall back to the target issue's assignee: writing to an issue
-      // assigned to the calling agent is own-issue work, not cross-issue
-      // influence, so it is allowed without being counted — the same semantics
-      // as the same-issue bypass below. Everything else stays fail-closed.
+      // An unscoped run still spends the cross-issue budget, but an issue
+      // assigned to this agent is its own work and retains the same-issue bypass.
       const targetIssue = await tx
         .select({ assigneeAgentId: issues.assigneeAgentId })
         .from(issues)
@@ -124,12 +126,13 @@ export async function observeCrossIssueInfluence(
           eq(issues.companyId, input.companyId),
         ))
         .then((rows) => rows[0] ?? null);
-      if (targetIssue?.assigneeAgentId === input.agentId) return null;
-      throw crossIssueInfluenceRunContextError();
+      if (!targetIssue) throw crossIssueInfluenceRunContextError();
+      if (targetIssue.assigneeAgentId === input.agentId) return null;
     }
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      sourceIssueId !== null &&
+      (sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
     ) {
       return null;
     }

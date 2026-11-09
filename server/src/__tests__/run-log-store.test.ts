@@ -45,6 +45,7 @@ async function seedLines(store = storeAt(base), lineCount = 200): Promise<{ hand
     // Reconstruct exactly what append persisted so `raw` mirrors the file.
     const line = JSON.stringify({
       ts: new Date(1_700_000_000_000 + i).toISOString(),
+      ...(handle.attemptId ? { attemptId: handle.attemptId } : {}),
       stream: "stdout",
       chunk: `chunk number ${i} with some repetitive streaming delta payload payload payload`,
     });

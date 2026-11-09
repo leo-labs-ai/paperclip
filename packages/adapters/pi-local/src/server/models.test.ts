@@ -129,6 +129,36 @@ describe("pi models", () => {
     }
   });
 
+  it("does not embed the model catalogue when the configured model is unavailable", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "paperclip-pi-models-"));
+    const command = path.join(directory, "pi");
+    const modelIds = Array.from({ length: 13 }, (_, index) => `provider/model-${index}`);
+    await writeFile(
+      command,
+      `#!/bin/sh\nprintf 'provider  model\\n';\n${modelIds
+        .map((id) => {
+          const [provider, model] = id.split("/");
+          return `printf '${provider}  ${model}\\n'`;
+        })
+        .join(";\n")}\n`,
+    );
+    await chmod(command, 0o755);
+
+    try {
+      await expect(
+        ensurePiModelConfiguredAndAvailable({
+          command,
+          model: "provider/missing",
+        }),
+      ).rejects.toMatchObject({
+        message:
+          "Configured Pi model is unavailable: provider/missing. 13 models are available; list them with `pi --list-models`.",
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("skips the model preflight when discovery times out", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(serverUtils, "runChildProcess").mockResolvedValue({
@@ -319,14 +349,13 @@ describe("pi models", () => {
     }
   });
 
-  it("lists close matches first and every available model in the unavailable error", () => {
+  it("suggests close models without embedding the full catalogue", () => {
     const models = Array.from({ length: 20 }, (_, i) => ({ id: `aaa/model-${String(i).padStart(2, "0")}`, label: "" }));
     models.push({ id: "clawrouter/gpt-5.6-luna-200k", label: "" }, { id: "clawrouter/gpt-5.6-sol-200k", label: "" });
     const message = formatPiModelUnavailableMessage("clawrouter/gpt-5.6-luna", models);
     expect(message).toContain("Did you mean: clawrouter/gpt-5.6-luna-200k");
-    expect(message).toContain("Available models (22):");
-    for (const entry of models) expect(message).toContain(entry.id);
-    expect(message).not.toContain("...");
+    expect(message).toContain("22 models are available; list them with `pi --list-models`.");
+    expect(message).not.toContain("aaa/model-00");
   });
 
   it("finds a model under another provider prefix and ignores unrelated ids", () => {

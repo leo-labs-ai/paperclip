@@ -4,6 +4,7 @@
 
 import type { AdapterExecutionTarget } from "./execution-target.js";
 import type { RuntimeStatusSink } from "./runtime-progress.js";
+import type { AdapterExecutionPhaseSink } from "./execution-phase.js";
 import type { ExecutionContinuationEnvelope, NativeFinalizationResult } from "@paperclipai/shared";
 
 export interface AdapterAgent {
@@ -29,17 +30,39 @@ export interface AdapterRuntime {
 // ---------------------------------------------------------------------------
 
 export interface UsageSummary {
+  /** Uncached input plus cache writes; excludes cache reads. Total tokens are input + cachedInput + output. */
   inputTokens: number;
   outputTokens: number;
   /** Cache *reads*: tokens served from a warm prompt cache, billed at a discount. */
   cachedInputTokens?: number;
   /**
-   * Cache *writes*: tokens written into the prompt cache, billed at a PREMIUM
-   * (Anthropic charges 1.25x input). A separate bucket from `inputTokens` --
-   * upstream reports `input + cacheRead + cacheWrite` as the prompt total, so
-   * folding writes into input would both under-bill and lose the distinction.
+   * Cache *writes* reported as a separate bucket, outside `inputTokens`.
+   * Some providers include writes in input instead; use `cacheWriteTokens`
+   * when the provider defines it as a subset of input.
    */
   cacheCreationInputTokens?: number;
+  /** Subset of `inputTokens`, not an additional token count. */
+  cacheWriteTokens?: number;
+}
+
+/** Accounting-only snapshot. Never include prompt, response, or credentials. */
+export interface AdapterUsageCheckpoint {
+  attemptId?: string;
+  usage?: UsageSummary;
+  usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
+  usageBasis?: "per_run" | "session_cumulative" | null;
+  provider?: string | null;
+  biller?: string | null;
+  model?: string | null;
+  billingType?: AdapterBillingType | null;
+  costUsd?: number | null;
+  costUsdExact?: string | null;
+  costStatus?: "reported" | "estimated" | "unpriced";
+  pricingContext?: { serviceTier?: string; contextTier?: "short" | "long" };
+  pricingProvenance?: { source: "provider_reported" | "provider_invoice" | "operator" | "rate_card" | "unknown"; version?: string; evidence?: string; inputCentsPerMillion?: string; cachedInputCentsPerMillion?: string; cacheWriteCentsPerMillion?: string; outputCentsPerMillion?: string; serviceTier?: string; contextTier?: "short" | "long" };
+  cacheAdjustedCostUsd?: number | null;
+  providerRequestId?: string | null;
+  complete: boolean;
 }
 
 export type AdapterBillingType =
@@ -74,6 +97,7 @@ export interface AdapterRuntimeServiceReport {
 }
 
 export type AdapterExecutionErrorFamily =
+  | "configuration"
   | "transient_upstream"
   | "provider_quota"
   | "model_refusal"
@@ -98,11 +122,14 @@ export interface AdapterExecutionResult {
   retryNotBefore?: string | null;
   errorMeta?: Record<string, unknown>;
   usage?: UsageSummary;
+  /** Complete per-model receipts, when supplied by the runtime. Their sums must match the run totals. */
+  usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
   /**
    * How `usage` totals are scoped. "per_run" means the tokens cover only this
    * execution; "session_cumulative" means they are running totals for the
    * persisted session, and the server must delta consecutive runs. Absent
-   * means unknown — the server applies its legacy session-delta heuristic.
+   * defaults to per-run; the server must never infer cumulative usage from a
+   * reused session ID.
    */
   usageBasis?: "per_run" | "session_cumulative" | null;
   /**
@@ -116,6 +143,12 @@ export interface AdapterExecutionResult {
   model?: string | null;
   billingType?: AdapterBillingType | null;
   costUsd?: number | null;
+  costUsdExact?: string | null;
+  costStatus?: "reported" | "estimated" | "unpriced";
+  pricingContext?: { serviceTier?: string; contextTier?: "short" | "long" };
+  pricingProvenance?: { source: "provider_reported" | "provider_invoice" | "operator" | "rate_card" | "unknown"; version?: string; evidence?: string; inputCentsPerMillion?: string; cachedInputCentsPerMillion?: string; cacheWriteCentsPerMillion?: string; outputCentsPerMillion?: string; serviceTier?: string; contextTier?: "short" | "long" };
+  providerRequestId?: string | null;
+  usageComplete?: boolean;
   /**
    * Whether this adapter's `usage.inputTokens` already contains cached reads.
    * Declared by the adapter because it depends on the upstream payload shape,
@@ -207,14 +240,29 @@ export interface AdapterRuntimeEvent {
   payload?: Record<string, unknown>;
 }
 
+export interface AgentRuntimeIdentity {
+  keyId: string;
+  publicKeyPem: string;
+  privateKeyPem: string;
+}
+
 export interface AdapterExecutionContext {
+  /** Company-owned exporter credentials. Transient; never persist or merge into config. */
+  observability?: import("./agent-observability.js").ProviderObservabilityLaunch;
+  /** Server-owned credentials. Never persist this object or merge it into config. */
+  agentIdentity?: AgentRuntimeIdentity;
+  /** Synchronous, content-free diagnostic scope; never stop or collection authority. */
+  onExecutionPhase?: AdapterExecutionPhaseSink;
   /** Run-scoped operator cancellation; adapters must settle before returning. */
   signal?: AbortSignal;
   /** Opt in to signal-based cancellation before starting provider work. */
   onCancellationReady?: () => Promise<void>;
-  /** Host-owned stop of this run's sandbox during setup. Resolves only after
+  /** Host-owned stop of this run's sandbox during setup or direct CLI execution. Resolves only after
    * provider termination is verified; never accepts an agent-selected lease. */
   stopRemoteStartup?: () => Promise<void>;
+  /** Host-owned collection after the final provider invocation is confirmed stopped,
+   * before remote workspace restore or disposal. Never call on an unverified timeout. */
+  onProviderStopped?: () => Promise<void>;
   /** Server-owned, actor-attributed snapshot also rendered by legacy wake prompts. */
   executionContinuation?: ExecutionContinuationEnvelope | null;
   runId: string;
@@ -222,6 +270,8 @@ export interface AdapterExecutionContext {
   runtime: AdapterRuntime;
   config: Record<string, unknown>;
   context: Record<string, unknown>;
+  /** Build bounded history only when an actual provider attempt starts fresh. */
+  getFreshSessionHandoff?: () => Promise<string | null>;
   runtimeCommandSpec?: AdapterRuntimeCommandSpec | null;
   executionTarget?: AdapterExecutionTarget | null;
   /**
@@ -236,6 +286,7 @@ export interface AdapterExecutionContext {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
+  onUsage?: (receipt: AdapterUsageCheckpoint) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
   /**
    * Reports that execution has crossed the adapter's dispatch boundary.
@@ -333,6 +384,7 @@ export interface AdapterEnvironmentTestContext {
   companyId: string;
   adapterType: string;
   config: Record<string, unknown>;
+  managedAiCredentialHome?: string;
   /**
    * Optional execution target the adapter should run probes against.
    *
@@ -472,6 +524,8 @@ export interface ServerAdapterModule {
   syncSkills?: (ctx: AdapterSkillContext, desiredSkills: string[]) => Promise<AdapterSkillSnapshot>;
   sessionCodec?: AdapterSessionCodec;
   sessionManagement?: import("./session-compaction.js").AdapterSessionManagement;
+  /** Selected harness can resume its conversation with this run's tool bindings. */
+  supportsToolRefreshOnResume?: boolean | ((config: Record<string, unknown>) => boolean);
   supportsLocalAgentJwt?: boolean;
   /** How this adapter receives Paperclip's run-scoped control tools. */
   runtimeToolDelivery?: AdapterRuntimeToolDelivery;
@@ -621,6 +675,8 @@ export interface PaperclipQuestion {
   helpText?: string;
   required: boolean;
   answerMode: "single_select" | "multi_select" | "text";
+  /** Editable starting text, never an implicit or submitted answer. Text mode only. */
+  initialText?: string;
   options?: PaperclipQuestionOption[];
   customAnswer?: { enabled: true; label?: string; placeholder?: string };
   textValidation?: {
@@ -681,8 +737,11 @@ export interface CLIAdapterModule {
 // ---------------------------------------------------------------------------
 
 export interface CreateConfigValues {
+  runner?: "auto" | "paperclip" | "legacy";
+  resolvedRunner?: "paperclip" | "legacy";
   adapterType: string;
   codexPermissionMode?: "never" | "on-request" | "untrusted";
+  codexLegacySandboxBypass?: boolean;
   paperclipRunnerLifecycleMode?: "per_turn" | "warm";
   paperclipRunnerIdleTimeoutMs?: number;
   cwd: string;

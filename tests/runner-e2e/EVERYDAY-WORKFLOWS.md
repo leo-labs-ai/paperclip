@@ -15,8 +15,10 @@ exact execution ID explicitly.
 | Hire a teammate and use them again | `hire-reuse` | One Morgan QA reporting to the lead, native runner and the same encrypted connection bindings, real child execution, then a second usable delivery from that same agent. |
 | Decide on an installed service action | `service-approve`, `service-decline` | Assign an authenticated local MCP fixture with Ask first; match its tool action and connection ID; no provider call before approval; exactly one after approval and a verified document; none after decline. |
 | Decline a new connection | `connection-decline` | Start without service connections; match a Notion connection intent; click Not now; verify the saved rejection, no new connection or repeated request, and an explanation followed by Done. |
+| Request an email address | `agentmail-setup` | Enable Chat connectors, ask for an email address, and require a durable AgentMail card for the requesting agent and user. Reload and verify one password field, the direct API-key link, and no access selectors or modal. Decline and verify no connection or repeated request. |
 | Continue work after a controller restart | `recover-controller` | Observe saved source, persist a user message, restart the isolated controller, and independently test the delivered result. |
 | Stop work and change direction | `stop-redirect` | Click Stop, send one new request, reload, observe exactly one stored user message and the new answer, and reach Done. |
+| Create and edit a company skill | `create-skill-studio` | Create one skill through the runner, verify its persisted library entry and activity-feed card, open Skill Studio, save an edit, and verify the edit after returning. Local Codex, local ACPX Claude, and warm Daytona cells are explicit. |
 
 For normal completion, all story tasks must reach Done, with no active run,
 pending completion confirmation, or scheduled recovery. Runs must prove native
@@ -35,13 +37,40 @@ See [controlled recovery tests](../runner-recovery/README.md).
 
 ## Matrix and running
 
-The local matrix has eight cases on native Codex `gpt-5.6-sol`, native ACPX Claude
-`claude-sonnet-5`, and native Codex `gpt-5.4-mini`: 24 cells. The two core profiles
-also declare build/revise, delegation, and controller-restart cases on Daytona:
-six cells. Remote runner-process killing is not supported. For remote controller
+The local matrix has fourteen cases on native Codex `gpt-5.6-sol`, native ACPX Claude
+`claude-sonnet-5`, and native Codex `gpt-5.4-mini`: 42 cells. The two core profiles
+also declare build/revise, delegation, controller-restart, and skill-creation cases
+on Daytona: eight cells. OpenCode adds only local hiring/reuse and delegation,
+for 52 cells total. Hiring/reuse and delegation have one attempt and a
+1,000-cent company and lead-agent hard stop. Remote runner-process killing is not supported. For remote controller
 restart, a verified first download supplies the persistence checkpoint; the
 controller is interrupted during a subsequent revision with another queued
 requirement.
+
+The native Codex Daytona restart cell now requires a completed native tool
+receipt while that revision is still running. Before and after restart it pins
+the same run, normalized session, Runner identity, PID/start time, and active
+sandbox lease. The original receipt prefix must remain unchanged. A run that
+ends before either active observation leaves the fault boundary unexercised;
+it cannot pass from the final ZIP alone. The cell no longer exempts an original
+Codex remote run that fails with `process_lost` and is replaced.
+
+Completion requires one original provider turn and control-plane terminal,
+the same native receipt prefix, no duplicate completed tool execution IDs,
+a committed run and successful `workspace_finalize` receipt, and no pending
+workspace operation or recovery. Existing independent ZIP and preserved-download
+checks still apply. These receipt checks do not prove that arbitrary external
+effects with different tool IDs cannot repeat.
+
+`remote-restart-before.json`, `remote-restart-after.json` and
+`remote-restart-final.json` retain receipt identities and hashes. They exclude
+provider text, tool arguments, command output, and raw provider sandbox IDs.
+The suite definition version and harness digest change with this oracle.
+Its deterministic calibration is not a claim that a live Daytona run passed.
+
+```sh
+pnpm test:e2e:runner -- --id everyday-workflows.runner-codex.daytona.recover-controller --max-automatic-retries 0
+```
 
 ```sh
 pnpm test:e2e:runner -- --list --suite everyday-workflows
@@ -51,8 +80,10 @@ pnpm test:e2e:runner -- --suite everyday-workflows --environment daytona --max-p
 ```
 
 Before project stories or the Python calibration tests, start Docker on the
-harness host and fetch the pinned oracle image. This is required for local and
-Daytona stories; artifact checks run on the harness host.
+harness host and fetch the pinned oracle image. CI prepares and verifies this
+same pinned image before the paid project-story cells; artifact checks run on
+the harness host. The workflow verifies the exact repository digest after the
+pull. This is required for local and Daytona stories.
 
 ```sh
 docker pull python@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
@@ -103,7 +134,7 @@ inputs; that is distinct from provider-side model identity verification.
 
 Initial live results are diagnostic. They are not a reliability estimate or a
 model ranking. Before promotion, freeze both source revisions and harness
-digest, run at least three independent local repetitions, qualify the six
+digest, run at least three independent local repetitions, qualify the eight
 remote cells against a verified image, and review every failure. Keep model
 quality, lifecycle correctness, infrastructure availability, and latency separate.
 
@@ -169,7 +200,7 @@ that the final response was visible.
 
 ## Recovery scope correction (14 September)
 
-The current catalog has **30 cells: 24 local and six remote**. Forced runner
+This correction reduced the catalog to **30 cells: 24 local and six remote**. Forced runner
 crash probes are retired from paid selection. Their original attempt IDs remain
 in Evalbook's Diagnostics history and Latest pages; they are excluded from the
 main matrix without changing grades or deleting evidence. Reported spend still
@@ -184,3 +215,73 @@ A future user-facing crash-recovery case needs a reproducible recoverable fault,
 an identified supported recovery action, and evidence through the final usable
 result. A missing test premise must be reported as unexercised, not a model
 failure. Do not introduce a new paid case just to replace a retired row.
+
+## Skill creation (16 September)
+
+`create-skill-studio` adds five cells: three local profiles and the two core
+profiles on Daytona. The current catalog has **35 cells: 27 local and eight
+remote**. The test opens the created skill from its task-feed card, checks the
+canonical skill identity in Studio, saves an edit, and returns to the same skill
+in the task sidebar. A model's authored document heading is not used as the
+identity check.
+
+## External-provider fallback
+
+Three explicit local cases cover aggregator routing with the normal production
+agent guidance. They add nine local cells. The AgentMail setup case adds three
+local cells; the suite now has 50 cells total.
+
+The AgentMail case uses real model discovery and production interaction/UI paths,
+but declines before sending credentials to AgentMail. Its independent grader is
+calibrated against missing, duplicate, misaddressed, hidden, and malformed cards.
+The email integration suite separately proves credential/inbox creation, access
+defaults, assignment checks, and completion using a fixture provider. Neither
+test qualifies live AgentMail delivery. Run a bounded local model cell with:
+
+```sh
+pnpm test:e2e:runner -- --id everyday-workflows.runner-codex-mini.local.agentmail-setup --max-automatic-retries 0
+```
+
+- `provider-native`: Jira is supported natively and by aggregators. Require the
+  Jira connection card directly, decline it in the browser, and verify no provider
+  question, connection creation, or repeated request.
+- `provider-decline`: HubSpot has no built-in connector in this fixture. Require
+  Composio, Arcade, Zapier, and None in that order with external-service disclosure.
+  Restart the controller, reload the question, choose None through the UI, and
+  verify one saved answer, no connection changes, and no fabricated result.
+- `provider-second`: Install a deterministic Arcade gateway with a read-only
+  HubSpot action through public APIs. Choose Arcade in the browser after restart.
+  Require no calls before selection, exactly one call afterwards, the independently
+  generated contact marker in the agent response, and no duplicate connection.
+
+These use the existing native profiles and 12-minute local attempt deadline;
+expected provider runs are two per case. There are no real third-party mutations.
+The fixture server is closed and the harness cleans its disposable instance.
+Provider-choice screenshots, persisted interactions, gateway call counts, source
+revision, harness digest, and existing usage/cost evidence accompany each attempt.
+`connection-routing-evidence.test.ts` calibrates the grader against undisclosed
+routing, incorrect ordering, early calls, duplicate questions, and fabricated reads.
+Run a single `everyday-workflows.runner-codex-mini.local.provider-decline` cell
+first; do not treat these fixtures as live provider compatibility tests.
+
+### Connection-guidance observation boundaries
+
+The explicit `native-connection-guidance` suite keeps one attempt per cell.
+For decline cases, Done and a succeeded run are insufficient: settlement waits
+within the existing cell deadline for a saved reply attributed by run ID to the
+lead agent's final successful run on this task. Readiness checks storage and
+identity, not favorable wording. A missing reply times out; an incorrect reply
+settles and fails the independent explanation check. Both decline explanation
+checks use the same bounded matcher, including unavailable/rejected access and
+“wasn't able to pull” wording. This is textual evidence, not proof of cognition.
+
+An executed approval or a recorded tool-action rejection with `wake_assignee`
+may precede its continuation run. Only a response bound to the same task, company,
+agent, and completed source run can defer the stranded-blocker check, and only
+within the original deadline. A failed execution, unrelated card, or already
+consumed response cannot extend that wait.
+
+`connection-guidance-decline-grade.json` and the workflow's
+`declineGradeEvidence` retain the exact cloned assertion input and original
+checks. Later final-state or cleanup observations cannot overwrite that input.
+Earlier campaign grades remain unchanged when the evaluator is corrected.

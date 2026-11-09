@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { Request, RequestHandler } from "express";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -21,6 +21,8 @@ import {
   rekeyCompanyIssueIdentifiers,
 } from "../services/issue-prefix.js";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
+import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
+import { loadAgentRunAuthentication } from "./agent-run-authentication.js";
 import {
   isRunIdParseError,
   isUuidLike,
@@ -32,6 +34,13 @@ import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { captureRunIdentity } from "../services/run-identity.js";
 import { boardAuthService } from "../services/board-auth.js";
+import { retryIdempotentDatabaseOperation } from "../database-retry.js";
+import { beginIdleTrackedWork } from "../services/task-admission.js";
+
+export {
+  isTransientDbConnectionError,
+  retryIdempotentDatabaseOperation as retryOnTransientDbConnectionError,
+} from "../database-retry.js";
 
 const CLOUD_TENANT_WRITE_DEBOUNCE_MS = 5_000;
 const CLOUD_TENANT_WRITE_DEBOUNCE_MAX = 1_000;
@@ -59,11 +68,12 @@ function pruneCloudTenantWriteDebounce(
     debounce.delete(oldestSubject);
   }
 }
-import { instanceSettingsService } from "../services/instance-settings.js";
+import { resolveOwnerInstanceAdmin } from "../services/cloud-tenant-authority.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { forbidden, unauthorized, unprocessable } from "../errors.js";
 
 export { isCloudManagedInstance } from "../services/cloud-instance.js";
+import { cloudTenantPrimaryCompanyId } from "../services/cloud-instance.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -168,24 +178,32 @@ async function auditAgentJwtRunHeaderMismatch(
   input: { companyId: string; agentId: string; claimRunId: string; headerRunId: string; method: string; url: string },
 ) {
   try {
-    await withAuthDbTimeout(() =>
-      db.insert(activityLog).values({
-        companyId: input.companyId,
-        actorType: "agent",
-        actorId: input.agentId,
-        action: "auth.agent_jwt_run_header_mismatch",
-        entityType: "heartbeat_run",
-        entityId: input.claimRunId,
-        ...(isUuidLike(input.agentId) ? { agentId: input.agentId } : {}),
-        ...(isUuidLike(input.claimRunId) ? { runId: input.claimRunId } : {}),
-        details: {
-          claimRunId: input.claimRunId,
-          headerRunId: input.headerRunId,
-          method: input.method,
-          url: input.url,
-        },
-      }),
-    );
+    // The claimed run id is untrusted input from a rejected token. activity_log
+    // .run_id is a real FK to heartbeat_runs, so populate that column only when
+    // the row exists. Bound both reads and writes; never replay the audit insert.
+    const claimedRunExists = isUuidLike(input.claimRunId)
+      ? await withAuthDbTimeout(() => db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, input.claimRunId))
+          .then((rows) => rows.length > 0))
+      : false;
+    await withAuthDbTimeout(() => db.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: "agent",
+      actorId: input.agentId,
+      action: "auth.agent_jwt_run_header_mismatch",
+      entityType: "heartbeat_run",
+      entityId: input.claimRunId,
+      ...(isUuidLike(input.agentId) ? { agentId: input.agentId } : {}),
+      ...(claimedRunExists ? { runId: input.claimRunId } : {}),
+      details: {
+        claimRunId: input.claimRunId,
+        headerRunId: input.headerRunId,
+        method: input.method,
+        url: input.url,
+      },
+    }));
   } catch (err) {
     logger.warn(
       { err, companyId: input.companyId, agentId: input.agentId, claimRunId: input.claimRunId },
@@ -227,11 +245,13 @@ interface ActorMiddlewareOptions {
   resolveSession?: (req: Request) => Promise<BetterAuthSessionResult | null>;
 }
 
+const publicRoutineWebhookPath = /^\/api\/routine-triggers\/public\/[a-f0-9]{24}\/fire\/?$/i;
+
 const publicMcpGatewayProtocolPath = /^\/mcp\/gateways\/gw_[a-f0-9]{32}\/?$/i;
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
-  return async (req, res, next) => {
+  const authenticate: RequestHandler = async (req, res, next) => {
     req.actor =
       opts.deploymentMode === "local_trusted"
         ? {
@@ -244,12 +264,15 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           }
         : { type: "none", source: "none" };
 
-    // Single trust boundary for X-Paperclip-Run-Id. The header flows into
-    // Postgres uuid columns (issues.checkout_run_id, etc.) via actor.runId,
-    // so anything that isn't a canonical UUID is rejected here before it can
-    // reach the service layer. Absent header: null (fall through to JWT
-    // claim, which is minted by services/heartbeat.ts). Empty string: 400,
-    // because that's a caller bug (send the header or omit it, don't blank).
+    // Routine ingress authenticates its own bearer/signature. Never interpret
+    // webhook credentials as agent keys or attach an ambient browser session.
+    if (req.method === "POST" && publicRoutineWebhookPath.test(req.path)) {
+      req.actor = { type: "none", source: "none" };
+      next();
+      return;
+    }
+
+    // Validate the run header before it can reach UUID-backed service fields.
     const runIdHeaderResult = parseOptionalRunId(req.header("x-paperclip-run-id"), "header");
     if (isRunIdParseError(runIdHeaderResult)) {
       logger.warn(
@@ -401,6 +424,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
+      if (agentRecord.lifecycleHolds?.includes("setup")) {
+        next(unauthorized("Agent setup is incomplete and cannot authenticate"));
+        return;
+      }
       if (agentRecord.status === "terminated") {
         next(unauthorized("Agent is terminated and cannot authenticate"));
         return;
@@ -430,16 +457,18 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
-      const [identityRun] = await authDbLookup(() =>
-        db.select({ activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
-          responsibleUserId: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status,
-          contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
-            eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
-          )),
-      );
-      if (identityRun?.status === "cancelled" && identityRun.contextSnapshot?.conversationMode === true
+      const [identityRun] = await loadAgentRunAuthentication(db, {
+        runId: claims.run_id,
+        companyId: claims.company_id,
+        agentId: claims.sub,
+      });
+      if (agentRunWritesRevoked(identityRun)
         && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
-        res.status(403).json({ error: "This conversation turn was cancelled", code: "conversation_turn_cancelled" });
+        const conversation = identityRun?.contextSnapshot?.conversationMode === true;
+        res.status(403).json({
+          error: conversation ? "This conversation turn was cancelled" : "This run was cancelled",
+          code: conversation ? "conversation_turn_cancelled" : "agent_run_cancelled",
+        });
         return;
       }
       if (identityRun?.activeIdentityContextId && identityRun.status === "running") {
@@ -448,6 +477,29 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         );
         identityRun.activeIdentityContextId = captured.context?.id ?? null;
         identityRun.responsibleUserId = captured.context?.responsibleUserId ?? null;
+      }
+      if (claims.authorizing_user_id) {
+        // This signed projection exists only for internal native tools. Recheck
+        // the admitted run and current immutable binding on every API call.
+        try {
+          const { parseNativeExecutionInput } = await import("../vendor/paperclip-runner/index.js");
+          const { museRunnerBroker } = await import("../services/muse-runner-broker.js");
+          const [nativeRun] = await db.select({ status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode,
+            nativeExecutionInput: sql<unknown>`${heartbeatRuns.runnerProfileJson}->'nativeExecutionInput'`,
+          }).from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
+          ));
+          const execution = parseNativeExecutionInput(nativeRun?.nativeExecutionInput);
+          if (nativeRun?.status !== "running" || nativeRun.runtimeMode !== "native" || execution.schema !== "paperclip.native-execution-input.v8"
+            || execution.binding.runId !== claims.run_id || execution.binding.agentId !== claims.sub || execution.binding.companyId !== claims.company_id
+            || await museRunnerBroker(db).authorizingUserIdForBinding(execution.provider.binding) !== claims.authorizing_user_id) {
+            throw new Error("Muse internal tool authority mismatch");
+          }
+          await museRunnerBroker(db).assertRunAuthority(execution);
+        } catch {
+          res.status(403).json({ error: "Muse native tool authority is unavailable" });
+          return;
+        }
       }
       const onBehalfOfUserId = identityRun?.activeIdentityContextId
         ? identityRun.responsibleUserId
@@ -471,6 +523,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         keyScope: normalizeAgentApiKeyScope(claims.key_scope),
         runId: claims.run_id,
         onBehalfOfUserId,
+        ...(claims.authorizing_user_id ? { authorizingUserId: claims.authorizing_user_id } : {}),
         identityContextId: identityRun?.activeIdentityContextId ?? null,
         onBehalfOfMemberships,
         source: "agent_jwt",
@@ -496,6 +549,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     if (!agentRecord || agentRecord.companyId !== key.companyId) {
       next(unauthorized("Agent record is missing or belongs to another company; obtain fresh credentials and retry"));
+      return;
+    }
+    if (agentRecord.lifecycleHolds?.includes("setup")) {
+      next(unauthorized("Agent setup is incomplete and cannot authenticate"));
       return;
     }
     if (agentRecord.status === "terminated") {
@@ -539,31 +596,22 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     next();
   };
-}
-
-/**
- * Whether the trusted-header actor being resolved should carry computed
- * instance-admin elevation: only the stack `owner` role elevates, and only
- * while `enableOwnerInstanceAdmin` is enabled. The flag is resolved through
- * the instance-settings service so the cloud managed-config overlay applies
- * (the harness can turn elevation off fleet-wide without touching tenant
- * DBs). Fails closed: a settings read error means no elevation.
- */
-async function resolveOwnerInstanceAdmin(
-  db: Db,
-  stackRole: "owner" | "admin" | "member" | "support",
-): Promise<boolean> {
-  if (stackRole !== "owner") return false;
-  try {
-    const experimental = await instanceSettingsService(db).getExperimental();
-    return experimental.enableOwnerInstanceAdmin === true;
-  } catch (err) {
-    logger.warn(
-      { err },
-      "Failed to resolve enableOwnerInstanceAdmin for cloud tenant owner; treating elevation as disabled",
-    );
-    return false;
-  }
+  return async (req, res, next) => {
+    // Health and task-drain requests bypass tenant admission, but resolving
+    // their actor can still write users, companies, memberships and key usage.
+    // Finish all authentication before entering the next handler: the report
+    // must count concurrent authentication, without counting its own auth.
+    const finish = beginIdleTrackedWork();
+    let continueRequest: (() => void) | undefined;
+    try {
+      await authenticate(req, res, (error?: unknown) => {
+        continueRequest = () => next(error);
+      });
+    } finally {
+      finish();
+    }
+    continueRequest?.();
+  };
 }
 
 /**
@@ -587,51 +635,6 @@ export function cloudActorHeaderSourceFromHeaders(
       return Array.isArray(value) ? value[0] : value;
     },
   };
-}
-
-/**
- * postgres.js codes for a connection the server side closed out from under
- * an in-flight query — a pooled Postgres endpoint recycling or suspending
- * (observed 2026-09-03 with a managed pooler closing the socket mid-INSERT).
- * The driver reconnects transparently on the next query; only the statement
- * that was on the wire is lost.
- */
-const transientDbConnectionCodes = new Set([
-  "CONNECTION_CLOSED",
-  "CONNECTION_ENDED",
-  "CONNECTION_DESTROYED",
-]);
-
-/**
- * True when the error chain (drizzle wraps the driver error as `cause`)
- * carries a postgres.js closed-connection code. Exported for tests.
- */
-export function isTransientDbConnectionError(error: unknown): boolean {
-  for (let current: unknown = error; current instanceof Error; current = current.cause) {
-    const code = (current as { code?: unknown }).code;
-    if (typeof code === "string" && transientDbConnectionCodes.has(code)) return true;
-  }
-  return false;
-}
-
-/**
- * Runs `run` and retries it up to twice when it fails on a transient
- * closed-connection error. Two replays, not one: when a pooled endpoint
- * suspends or recycles, EVERY pooled socket is dead at once, so the first
- * replay can draw another stale socket from the pool and fail identically
- * (observed 2026-09-12: retried actor resolution still surfacing
- * CONNECTION_CLOSED). The short pause gives the driver time to notice and
- * re-dial. Callers must pass an idempotent operation. Exported for tests.
- */
-export async function retryOnTransientDbConnectionError<T>(run: () => Promise<T>): Promise<T> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return await run();
-    } catch (error) {
-      if (attempt >= 2 || !isTransientDbConnectionError(error)) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
-    }
-  }
 }
 
 const DEFAULT_AUTH_DB_TIMEOUT_MS = 5_000;
@@ -691,7 +694,7 @@ export class AuthDbTimeoutError extends Error {
  * whatever the auth path's general-purpose timeout happens to be.
  */
 export async function authDbLookup<T>(run: () => Promise<T>, timeoutMsOverride?: number): Promise<T> {
-  return withAuthDbTimeout(() => retryOnTransientDbConnectionError(run), timeoutMsOverride);
+  return withAuthDbTimeout(() => retryIdempotentDatabaseOperation(run), timeoutMsOverride);
 }
 
 /**
@@ -717,7 +720,7 @@ export async function withAuthDbTimeout<T>(run: () => Promise<T>, timeoutMsOverr
 }
 
 /**
- * Trusted-header actor resolution with a single transient-connection retry.
+ * Trusted-header actor resolution with bounded transient-connection retries.
  * The tenant sync inside is idempotent end to end — every write is an
  * upsert/on-conflict/delete and the write debounce records only after the
  * whole sync succeeds — so replaying it after a dropped connection is safe,
@@ -727,7 +730,7 @@ export async function resolveCloudTenantActor(
   db: Db,
   req: CloudActorHeaderSource,
 ): Promise<Express.Request["actor"] | null> {
-  return retryOnTransientDbConnectionError(() => resolveCloudTenantActorOnce(db, req));
+  return retryIdempotentDatabaseOperation(() => resolveCloudTenantActorOnce(db, req));
 }
 
 async function resolveCloudTenantActorOnce(
@@ -899,6 +902,7 @@ async function resolveCloudTenantActorOnce(
     // company-scoped. Turning the flag off de-elevates on the next request —
     // there is no role row to clean up.
     isInstanceAdmin: await resolveOwnerInstanceAdmin(db, stackRole),
+    canManageExperimentalSettings: stackRole === "admin",
     source: "cloud_tenant",
   };
 }
@@ -925,11 +929,7 @@ function constantTimeStringEqual(left: string, right: string): boolean {
 }
 
 function cloudTenantCompanyId(stackId: string): string {
-  const bytes = createHash("sha256").update(`paperclip-cloud-tenant-company:${stackId}`).digest();
-  bytes[6] = (bytes[6] & 0x0f) | 0x50;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = bytes.subarray(0, 16).toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+  return cloudTenantPrimaryCompanyId(stackId);
 }
 
 export function humanizeCloudStackSlug(stackId: string): string {

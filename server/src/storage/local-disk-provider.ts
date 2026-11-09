@@ -65,9 +65,7 @@ export function createLocalDiskStorageProvider(baseDir: string): StorageProvider
           try {
             await fs.link(tempPath, targetPath);
           } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-              throw conflict("Object already exists");
-            }
+            if ((error as NodeJS.ErrnoException).code === "EEXIST") throw conflict("Object already exists");
             throw error;
           }
           await fs.unlink(tempPath);

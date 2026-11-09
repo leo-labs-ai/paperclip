@@ -52,3 +52,40 @@ describe("workspace reaper cooldown config parsing", () => {
     expect(loadConfig().workspaceReaperCooldownDays).toBe(7);
   });
 });
+
+// The reaper reads PAPERCLIP_WORKSPACE_COMPACTION_DELAY_HOURS and
+// PAPERCLIP_WORKSPACE_COMPACTION_ENABLED. The default delay is 1 hour, an
+// explicit 0 compacts on the next sweep, invalid values fall back to the
+// default, and only an explicit "false" turns compaction off.
+describe("workspace compaction config parsing", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("uses the 1 hour default when the variables are not set", () => {
+    vi.stubEnv("PAPERCLIP_WORKSPACE_COMPACTION_DELAY_HOURS", undefined);
+    vi.stubEnv("PAPERCLIP_WORKSPACE_COMPACTION_ENABLED", undefined);
+    expect(loadConfig().workspaceCompactionDelayHours).toBe(1);
+  });
+
+  it("keeps an explicit 0 and reads fractional hours", () => {
+    vi.stubEnv("PAPERCLIP_WORKSPACE_COMPACTION_DELAY_HOURS", "0");
+    expect(loadConfig().workspaceCompactionDelayHours).toBe(0);
+    vi.stubEnv("PAPERCLIP_WORKSPACE_COMPACTION_DELAY_HOURS", " 0.5 ");
+    expect(loadConfig().workspaceCompactionDelayHours).toBe(0.5);
+  });
+
+  it("uses the 1 hour default for empty, negative, or non-numeric values", () => {
+    for (const value of ["", "   ", "-2", "later"]) {
+      vi.stubEnv("PAPERCLIP_WORKSPACE_COMPACTION_DELAY_HOURS", value);
+      expect(loadConfig().workspaceCompactionDelayHours).toBe(1);
+    }
+  });
+
+  it("turns compaction off only for an explicit false", () => {
+    vi.stubEnv("PAPERCLIP_WORKSPACE_COMPACTION_ENABLED", "false");
+    expect(loadConfig().workspaceCompactionDelayHours).toBeNull();
+    vi.stubEnv("PAPERCLIP_WORKSPACE_COMPACTION_ENABLED", "no");
+    expect(loadConfig().workspaceCompactionDelayHours).toBe(1);
+  });
+});

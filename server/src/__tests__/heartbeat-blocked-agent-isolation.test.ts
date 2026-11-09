@@ -3,6 +3,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
   agentWakeupRequests,
+  approvals,
+  budgetIncidents,
   budgetPolicies,
   companies,
   costEvents,
@@ -53,10 +55,12 @@ describeEmbeddedPostgres("heartbeat blocked-agent isolation", () => {
 
   afterEach(async () => {
     await db.delete(costEvents);
+    await db.delete(budgetIncidents);
     await db.delete(budgetPolicies);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(approvals);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -131,9 +135,8 @@ describeEmbeddedPostgres("heartbeat blocked-agent isolation", () => {
     const heartbeat = heartbeatService(db);
     const result = await heartbeat.tickTimers(new Date("2026-06-04T00:10:00Z"));
 
-    // Before the fix this rejected with HttpError and nothing below was reached.
-    // skipped === 2 is the load-bearing assertion: both agents were carried all the way into
-    // enqueueWakeup, so the blocked agent's throw did not end the sweep.
+    // Before the fix this rejected with HttpError and never reached the healthy agent.
+    // Both timer attempts now produce durable skips, and the sweep completes.
     expect(result.checked).toBe(2);
     expect(result.skipped).toBe(2);
 
