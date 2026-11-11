@@ -30,6 +30,8 @@ export interface DeleteObjectInput {
 export interface GetObjectInput {
   objectKey: string;
   version?: string;
+  // S3 reads cancel pending requests and their response streams.
+  signal?: AbortSignal;
   range?: {
     start: number;
     end: number;
@@ -67,15 +69,16 @@ export interface StorageProvider {
   deleteObject(input: DeleteObjectInput): Promise<void>;
 }
 
-export interface PutFileInput {
+export type PutFileInput = {
+  /** Server-allocated, company-prefixed key for durable idempotent uploads. Never accept from client input. */
+  objectKey?: string;
   companyId: string;
   /** Commit integrity metadata when this upload is a durable HA artifact. */
   durableKind?: DurableObjectKind;
   namespace: string;
   originalFilename: string | null;
   contentType: string;
-  body: Buffer;
-}
+} & ({ body: Buffer } | { body: Readable; byteSize: number; sha256: string });
 
 export interface PutFileResult {
   provider: StorageProviderId;
@@ -91,7 +94,7 @@ export interface StorageService {
   provider: StorageProviderId;
   shared: boolean;
   putFile(input: PutFileInput): Promise<PutFileResult>;
-  getObject(companyId: string, objectKey: string, options?: Pick<GetObjectInput, "range">): Promise<GetObjectResult>;
+  getObject(companyId: string, objectKey: string, options?: Pick<GetObjectInput, "range" | "signal">): Promise<GetObjectResult>;
   headObject(companyId: string, objectKey: string): Promise<HeadObjectResult>;
   deleteObject(companyId: string, objectKey: string): Promise<void>;
 }

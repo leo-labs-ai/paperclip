@@ -154,6 +154,11 @@ export async function releaseRunOwnership(
  * skew between them could let a replica take over a lease that has not
  * really lapsed, or fail to take over one that has.
  *
+ * The same UPDATE also checks the legacy controller lease. A stale run lease
+ * alone cannot authorize takeover while its controller is still alive. Missing
+ * controller expiry with a present boot ID is unknown authority: fail closed.
+ * Renewal and this takeover serialize on the same row, with DB-clock checks.
+ *
  * This is a single conditional UPDATE, so at most one racing caller can win
  * it — the loser's UPDATE matches 0 rows and gets null back, exactly like
  * every other CAS helper in this file. The winner's new `{ ownerToken,
@@ -178,6 +183,10 @@ export async function claimExpiredLease(
     WHERE id = ${input.runId}
       AND status = 'running'
       AND lease_expires_at is not null
+      AND (
+        (controller_boot_id IS NULL AND controller_lease_expires_at IS NULL)
+        OR controller_lease_expires_at <= now()
+      )
       AND lease_expires_at < now() - (${graceMs}::text || ' milliseconds')::interval
     RETURNING *
   `)) as unknown as Array<Record<string, unknown>>;

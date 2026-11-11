@@ -5,7 +5,8 @@ import {
   HeadObjectCommand,
   PutObjectCommand,
 } from "@aws-sdk/client-s3";
-import { Readable } from "node:stream";
+import { putS3Multipart } from "./s3-multipart.js";
+import { addAbortSignal, Readable } from "node:stream";
 import type { StorageProvider, GetObjectResult, HeadObjectResult } from "./types.js";
 import { conflict, notFound, unprocessable } from "../errors.js";
 
@@ -41,14 +42,9 @@ async function toReadableStream(body: unknown): Promise<Readable> {
 
   if (typeof candidate.transformToWebStream === "function") {
     const webStream = candidate.transformToWebStream();
-    const reader = webStream.getReader();
-    return Readable.from((async function* () {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) yield value;
-      }
-    })());
+    // Native conversion cancels a pending reader.read() when the Node stream
+    // is destroyed. An async-generator wrapper cannot interrupt that await.
+    return Readable.fromWeb(webStream as Parameters<typeof Readable.fromWeb>[0]);
   }
 
   if (typeof candidate.arrayBuffer === "function") {
@@ -83,6 +79,12 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
 
     async putObject(input) {
       const key = buildKey(prefix, input.objectKey);
+      // The multipart helper cannot conditionally create or return a version.
+      // Immutable durable uploads must retain the single-PUT integrity contract.
+      if (input.contentLength > 16 * 1024 * 1024 && !input.ifNoneMatch && !input.checksumSha256) {
+        await putS3Multipart(client, bucket, key, input);
+        return {};
+      }
       try {
         const output = await client.send(
           new PutObjectCommand({
@@ -120,10 +122,13 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
             VersionId: input.version,
             Range: input.range ? `bytes=${input.range.start}-${input.range.end}` : undefined,
           }),
+          { abortSignal: input.signal },
         );
 
+        const stream = await toReadableStream(output.Body);
+        if (input.signal) addAbortSignal(input.signal, stream);
         return {
-          stream: await toReadableStream(output.Body),
+          stream,
           contentType: output.ContentType,
           contentLength: output.ContentLength,
           etag: output.ETag,
@@ -148,6 +153,7 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
             VersionId: input.version,
             ChecksumMode: "ENABLED",
           }),
+          { abortSignal: input.signal },
         );
 
         return {

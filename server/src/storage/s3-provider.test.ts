@@ -1,3 +1,6 @@
+import { Readable } from "node:stream";
+import { buffer } from "node:stream/consumers";
+import { ReadableStream } from "node:stream/web";
 import {
   DeleteObjectCommand,
   GetObjectCommand,
@@ -100,4 +103,38 @@ describe("S3 storage provider", () => {
     expect(send.mock.calls[2]?.[0]).toBeInstanceOf(DeleteObjectCommand);
     expect(send.mock.calls[2]?.[0].input).toMatchObject({ VersionId: "version-1" });
   });
+  it("cancels a stalled web response body and passes the signal to the SDK", async () => {
+    let cancelled!: () => void;
+    const bodyCancelled = new Promise<void>(resolve => { cancelled = resolve; });
+    const web = new ReadableStream<Uint8Array>({ cancel() { cancelled(); } });
+    send.mockResolvedValue({ Body: { transformToWebStream: () => web } });
+    const controller = new AbortController();
+    const result = await provider().getObject({
+      objectKey: "company-1/run-logs/abort", version: "version-1", signal: controller.signal,
+    });
+    const rejected = expect(buffer(result.stream)).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await rejected;
+    await bodyCancelled;
+    expect(send.mock.calls[0]?.[1]).toEqual({ abortSignal: controller.signal });
+  });
+
+  it("keeps large immutable uploads on conditional PUT instead of unconditional multipart", async () => {
+    send.mockResolvedValue({ VersionId: "immutable-version", ETag: "etag" });
+    const body = Readable.from([Buffer.from("fixture")]);
+    try {
+      const result = await provider().putObject({
+        objectKey: "company-1/run-logs/archive", body,
+        contentType: "application/octet-stream", contentLength: 17 * 1024 * 1024,
+        checksumSha256: "checksum", ifNoneMatch: true,
+      });
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0]?.[0]).toBeInstanceOf(PutObjectCommand);
+      expect(send.mock.calls[0]?.[0].input).toMatchObject({ IfNoneMatch: "*", ChecksumSHA256: "checksum" });
+      expect(result.version).toBe("immutable-version");
+    } finally {
+      body.destroy();
+    }
+  });
+
 });

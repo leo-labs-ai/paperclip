@@ -13,11 +13,38 @@ Use this skill when you are asked to hire/create an agent.
 
 ## Preconditions
 
-You need either board access or agent permission `can_create_agents=true` in your company. If you do not have this permission, escalate to your CEO or board.
+You need either:
+- board access, or
+- agent permission `can_create_agents=true` in your company
 
-All API calls use `curl -sS` with `-H "Authorization: Bearer $PAPERCLIP_API_KEY"`. Endpoint inventory, hire payload shape, and response/approval semantics: `references/api-reference.md`.
+If you do not have this permission, keep the current task assigned to yourself
+and identify the missing hiring authority. A CEO or manager title does not grant
+hiring permission. Do not reassign the task or create an escalation task to bypass
+the denial. Use the applicable approval flow when available; otherwise save a
+human-input interaction on the current task with `resolverPolicy: "human_only"`
+and `continuationPolicy: "wake_assignee"`, then leave it `in_review`. Use the
+complete human-input payload in the `paperclip` skill; when the requesting user
+owns the decision, address it with their actual `addresseeUserId`. A human answer
+does not itself grant permission: recheck authorization before any hire.
 
 ## Workflow
+
+### Choose the API transport
+
+On **Paperclip Runner**, use the advertised Paperclip tools. Use `get_task_context`
+and `list_agents` for identity and team context, then `search_api` to discover the
+configuration, instruction-template, icon, and `agent-hires` endpoints used below.
+Call the discovered operations with `call_api`; the server supplies company and
+authentication context. Read the returned schemas before drafting the hire.
+
+For adapters that receive `PAPERCLIP_API_URL` and `PAPERCLIP_API_KEY`, use
+`curl -sS` with `-H "Authorization: Bearer $PAPERCLIP_API_KEY"`. Read
+`references/api-reference.md` for endpoint payloads and approval semantics. Paperclip Runner does not supply those variables. Do not
+search workspace files for a server address or credentials to recreate that path.
+If `search_api` / `call_api` are unavailable, report that hiring requires the
+operator to enable runner API tools for this company. Preserve the proposed hire
+in the conversation; do not claim an agent was created or substitute a temporary
+subagent for the requested permanent hire.
 
 ### 1. Confirm identity and company context
 
@@ -31,17 +58,27 @@ All API calls use `curl -sS` with `-H "Authorization: Bearer $PAPERCLIP_API_KEY"
 
 `GET /api/companies/$PAPERCLIP_COMPANY_ID/agent-configurations` — note naming, icon, reporting-line, and adapter conventions the company already follows.
 
-### 4. Choose the instruction source (required)
+### 4. Describe the role
 
-This is the single most important decision for hire quality. Pick exactly one path:
+Use a short role paragraph for a new agent: its identity and the responsibility
+it owns. The [role examples](references/agent-instruction-templates.md) are
+optional starting points; for other roles, use the
+[baseline role guide](references/baseline-role-guide.md).
 
-- **Exact template** — the role matches an entry in the template index. Use the matching file under `references/agents/` as the starting point.
-- **Adjacent template** — no exact match, but an existing template is close (for example, a "Backend Engineer" hire adapted from `coder.md`, or a "Content Designer" adapted from `uxdesigner.md`). Copy the closest template and adapt deliberately: rename the role, rewrite the role charter, swap domain lenses, and remove sections that do not fit.
-- **Generic fallback** — no template is close. Use the baseline role guide to construct a new `AGENTS.md` from scratch, filling in each recommended section for the specific role.
+Company-specific instructions supplied by the requester take precedence. Do not
+expand a role description into a generic operating manual. The harness supplies
+Paperclip coordination, skill discovery, and task lifecycle guidance; repository
+instructions and installed skills carry applicable work procedures. Avoid
+adding heartbeat pointers, execution contracts, fixed reviewer routes, or catalogs of
+domain concepts to the hire's instructions. Keep the role gates that apply: managers
+delegate instead of writing code and always comment on their task; QA tries the documented
+test-account login before reporting a login wall; designers render UI-visible work at a real
+viewport before a verdict; plan approval uses `request_confirmation` on the latest plan revision.
 
-Template index and when-to-use guidance: `references/agent-instruction-templates.md`. Generic fallback: `references/baseline-role-guide.md`.
-
-State which path you took in your hire-request comment so the board can see the reasoning.
+Keep reporting lines in `reportsTo`, capabilities in `capabilities`, and skills
+in `desiredSkills`. Add instruction detail only for a concrete company or role
+requirement that those fields, the task, repository instructions, or installed
+skills do not already express.
 
 ### 5. Discover allowed agent icons
 
@@ -56,9 +93,7 @@ State which path you took in your hire-request comment so the board can see the 
 - leave timer heartbeats off by default; only set `runtimeConfig.heartbeat.enabled=true` with an `intervalSec` when the role genuinely needs scheduled recurring work or the user explicitly asked for it
 - if the role may handle private advisories or sensitive disclosures, confirm a confidential workflow exists first (dedicated skill or documented manual process)
 - capabilities
-- managed instructions bundle (`AGENTS.md`) for adapters that support it; avoid durable `promptTemplate` config
-- for coding or execution agents, include the Paperclip execution contract: start actionable work in the same heartbeat; do not stop at a plan unless planning was requested; leave durable progress with a clear next action; use child issues for long or parallel delegated work instead of polling; mark blocked work with owner/action; respect budget, pause/cancel, approval gates, and company boundaries
-- instruction text such as `AGENTS.md` built from step 4; for local managed-bundle adapters, send this as top-level `instructionsBundle.files["AGENTS.md"]`. Do not set `adapterConfig.promptTemplate` or `bootstrapPromptTemplate` for new agents.
+- when supplying role instructions from step 4, send them as top-level `instructionsBundle.files["AGENTS.md"]` for managed-bundle adapters. Otherwise use the server default. Do not set `adapterConfig.promptTemplate` or `bootstrapPromptTemplate` for new agents.
 - source issue linkage (`sourceIssueId` or `sourceIssueIds`) when this hire came from an issue
 
 ### 7. Review the draft against the quality checklist
@@ -72,13 +107,14 @@ Walk `references/draft-review-checklist.md` end-to-end and fix any item that doe
 ### 9. Handle governance state
 
 - if the response has `approval`, the hire is `pending_approval`
+- before reporting the agent ready, check whether it is pending company approval; a `pending_approval` hire is awaiting approval, not ready (it cannot run heartbeats, take assignments, or create keys)
 - monitor and discuss on the approval thread (`GET/POST /api/approvals/<id>/comments`); link the approval to its source issue via `POST /api/issues/<issue-id>/approvals` if needed
 - when the board approves, you will be woken with `PAPERCLIP_APPROVAL_ID`; fetch the approval and its linked issues (`GET /api/approvals/$PAPERCLIP_APPROVAL_ID` + `/issues`), then for each linked issue either close it if the approval resolved the request, or comment in markdown with links to the approval and next actions.
 
 ## References
 
-- Template index and how to apply a template: `references/agent-instruction-templates.md`
+- Optional role examples: `references/agent-instruction-templates.md`
 - Individual role templates: `references/agents/`
-- Generic baseline role guide (no-template fallback): `references/baseline-role-guide.md`
-- Pre-submit draft-review checklist: `references/draft-review-checklist.md`
-- Endpoint inventory, payload shapes, approval lifecycle: `references/api-reference.md`
+- Short role drafting guide: `references/baseline-role-guide.md`
+- Before submitting a hire: `references/draft-review-checklist.md`
+- Endpoint payloads and approval lifecycle: `references/api-reference.md`

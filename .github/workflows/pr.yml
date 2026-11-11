@@ -228,6 +228,8 @@ jobs:
             shard_count: 2
           - group: general-workspaces-b
             group_label: workspaces-b
+          - group: general-workspaces-c
+            group_label: workspaces-c
 
     steps:
       - name: Checkout repository

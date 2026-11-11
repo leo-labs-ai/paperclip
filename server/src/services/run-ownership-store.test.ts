@@ -248,6 +248,38 @@ describeEmbeddedPostgres("run ownership store", () => {
     }
   });
 
+  it("requires both the durable run lease and controller lease to expire", async () => {
+    const { companyId, agentId } = await seedCompanyAgent();
+    const runId = await seedRunningRun({ companyId, agentId, leaseExpiresAt: new Date(0) });
+    try {
+      await db.update(heartbeatRuns).set({
+        controllerBootId: "controller-a",
+        controllerLeaseExpiresAt: sql`now() + interval '1 hour'`,
+      }).where(eq(heartbeatRuns.id, runId));
+      expect(await claimExpiredLease(db2, { runId })).toBeNull();
+
+      // A controller without an expiry is not proof of a dead controller.
+      await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: null })
+        .where(eq(heartbeatRuns.id, runId));
+      expect(await claimExpiredLease(db2, { runId })).toBeNull();
+
+      await db.update(heartbeatRuns).set({
+        controllerLeaseExpiresAt: sql`now() - interval '1 second'`,
+        leaseExpiresAt: sql`now() + interval '1 hour'`,
+      }).where(eq(heartbeatRuns.id, runId));
+      expect(await claimExpiredLease(db2, { runId })).toBeNull();
+
+      await db.update(heartbeatRuns).set({ leaseExpiresAt: sql`now() - interval '1 second'` })
+        .where(eq(heartbeatRuns.id, runId));
+      const takeover = await claimExpiredLease(db2, { runId });
+      expect(takeover?.ownerToken).toBeTruthy();
+      expect(takeover?.fence).not.toBeNull();
+      expect(await claimExpiredLease(db, { runId })).toBeNull();
+    } finally {
+      await cleanup(companyId, agentId);
+    }
+  });
+
   it("two connections racing claimExpiredLease: exactly one wins, with a higher fence than the original", async () => {
     const { companyId, agentId } = await seedCompanyAgent();
     const now = new Date();

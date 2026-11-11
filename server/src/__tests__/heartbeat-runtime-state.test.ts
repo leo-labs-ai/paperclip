@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
+  costEvents,
   agents,
   agentRuntimeState,
   agentWakeupRequests,
@@ -52,6 +53,7 @@ describeEmbeddedPostgres("heartbeat runtime state deduplication", () => {
   afterEach(async () => {
     clearAllHeartbeatRunRuntimeStatuses();
     await db.delete(heartbeatRunEvents);
+    await db.delete(costEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
@@ -134,6 +136,9 @@ describeEmbeddedPostgres("heartbeat runtime state deduplication", () => {
       agentId,
       invocationSource: "assignment",
       status: "running",
+      ownerToken: "runtime-state-owner",
+      fence: 7,
+      controllerBootId: "00000000-0000-4000-8000-000000000001",
       contextSnapshot: { issueId },
     }).returning();
     const run = insertedRun!;
@@ -150,7 +155,11 @@ describeEmbeddedPostgres("heartbeat runtime state deduplication", () => {
         currentToolName: "bash",
         lastAssistantSnippet: "Inspecting the repository",
         lastEventAt: "2026-06-24T00:00:05.000Z",
-      }, issueId);
+      }, issueId, {
+        kind: "legacy",
+        executionClaim: { ownerToken: "runtime-state-owner", fence: 7 },
+        executionControllerBootId: "00000000-0000-4000-8000-000000000001",
+      });
 
       expect(status).toMatchObject({
         companyId,
@@ -232,6 +241,9 @@ describeEmbeddedPostgres("heartbeat runtime state deduplication", () => {
       agentId,
       invocationSource: "assignment",
       status: "running",
+      ownerToken: "runtime-state-owner",
+      fence: 7,
+      controllerBootId: "00000000-0000-4000-8000-000000000001",
       contextSnapshot: { issueId },
     }).returning();
     const staleRunningRun = insertedRun!;
@@ -245,7 +257,11 @@ describeEmbeddedPostgres("heartbeat runtime state deduplication", () => {
       await heartbeat.recordRuntimeProgress(staleRunningRun, {
         phase: "config_sync",
         message: "Syncing workspace to environment",
-      }, issueId);
+      }, issueId, {
+        kind: "legacy",
+        executionClaim: { ownerToken: "runtime-state-owner", fence: 7 },
+        executionControllerBootId: "00000000-0000-4000-8000-000000000001",
+      });
 
       expect(getHeartbeatRunRuntimeStatus(runId)).toMatchObject({
         runId,
@@ -262,10 +278,16 @@ describeEmbeddedPostgres("heartbeat runtime state deduplication", () => {
         })
         .where(eq(heartbeatRuns.id, runId));
 
+      // Terminal reads invalidate the cache; a stale executor must not clear a successor's progress.
+      heartbeat.decorateActiveRunStatus({ ...staleRunningRun, status: "succeeded" });
       const lateStatus = await heartbeat.recordRuntimeProgress(staleRunningRun, {
         phase: "finalize",
         message: "Finalizing workspace",
-      }, issueId);
+      }, issueId, {
+        kind: "legacy",
+        executionClaim: { ownerToken: "runtime-state-owner", fence: 7 },
+        executionControllerBootId: "00000000-0000-4000-8000-000000000001",
+      });
 
       expect(lateStatus).toBeNull();
       expect(getHeartbeatRunRuntimeStatus(runId)).toBeNull();

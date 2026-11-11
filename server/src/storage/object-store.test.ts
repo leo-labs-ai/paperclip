@@ -312,7 +312,7 @@ describe("durable object store", () => {
     await expect(corruptRetry.put(input)).rejects.toThrow("retry verification failed");
   });
 
-  it("cleans up an uploaded object when metadata commit fails", async () => {
+  it("retains uploaded bytes when metadata commit outcome is uncertain", async () => {
     const deleteObject = vi.fn(async () => {});
     const { provider } = fixture({ deleteObject });
     const body = Buffer.from("shared bytes");
@@ -335,7 +335,7 @@ describe("durable object store", () => {
       contentLength: body.length,
       sha256: sha256(body),
     })).rejects.toThrow("database unavailable");
-    expect(deleteObject).toHaveBeenCalledWith({ objectKey: "system/backups/backup-1.sql.gz", version: "v1" });
+    expect(deleteObject).not.toHaveBeenCalled();
   });
 
   it("deletes the committed version before tombstoning its metadata", async () => {
@@ -431,4 +431,119 @@ describe("durable object store", () => {
       sha256: sha256(body),
     })).rejects.toThrow("company-1/");
   });
+  it("passes cancellation to a pending immutable-version GET", async () => {
+    let started!: () => void;
+    const pending = new Promise<void>(resolve => { started = resolve; });
+    const getObject = vi.fn<StorageProvider["getObject"]>(async input => {
+      expect(input.version).toBe("v1");
+      started();
+      return new Promise((_resolve, reject) => {
+        input.signal!.addEventListener("abort", () => reject(input.signal!.reason), { once: true });
+      });
+    });
+    const { store, metadata } = fixture({ getObject });
+    const body = Buffer.from("bytes");
+    const committed = await store.put({ companyId: "company-1", kind: "run_log",
+      objectKey: "company-1/run-logs/cancel", contentType: "application/octet-stream",
+      body, contentLength: body.length, sha256: sha256(body) });
+    const controller = new AbortController();
+    const read = store.get(committed, { signal: controller.signal });
+    const rejected = expect(read).rejects.toMatchObject({ name: "AbortError" });
+    await pending;
+    controller.abort();
+    await rejected;
+    expect(getObject).toHaveBeenCalledWith({ objectKey: committed.objectKey, version: "v1", signal: controller.signal });
+    expect(metadata.markCorrupt).not.toHaveBeenCalled();
+  });
+
+  it("destroys a stalled integrity source on cancellation without marking it corrupt", async () => {
+    const source = new Readable({ read() {} });
+    const { store, metadata } = fixture({ async getObject() { return { stream: source }; } });
+    const body = Buffer.from("bytes");
+    const committed = await store.put({ companyId: "company-1", kind: "run_log",
+      objectKey: "company-1/run-logs/cancel-body", contentType: "application/octet-stream",
+      body, contentLength: body.length, sha256: sha256(body) });
+    const controller = new AbortController();
+    const stream = await store.get(committed, { signal: controller.signal });
+    const rejected = expect(buffer(stream)).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await rejected;
+    expect(source.destroyed).toBe(true);
+    expect(metadata.markCorrupt).not.toHaveBeenCalled();
+  });
+
+  it("forwards source errors through the integrity stream", async () => {
+    const failure = new Error("fixture transport closed");
+    const source = new Readable({ read() { this.destroy(failure); } });
+    const { store, metadata } = fixture({ async getObject() { return { stream: source }; } });
+    const body = Buffer.from("bytes");
+    const committed = await store.put({ companyId: "company-1", kind: "run_log",
+      objectKey: "company-1/run-logs/source-error", contentType: "application/octet-stream",
+      body, contentLength: body.length, sha256: sha256(body) });
+    await expect(buffer(await store.get(committed))).rejects.toBe(failure);
+    expect(source.destroyed).toBe(true);
+    expect(metadata.markCorrupt).not.toHaveBeenCalled();
+  });
+
+  it("stops the underlying source when a bounded reader closes early", async () => {
+    let emitted = false;
+    const source = new Readable({ read() {
+      if (!emitted) { emitted = true; this.push(Buffer.from("prefix")); }
+    } });
+    const { store, metadata } = fixture({ async getObject() { return { stream: source }; } });
+    const body = Buffer.from("prefix-tail");
+    const committed = await store.put({ companyId: "company-1", kind: "run_log",
+      objectKey: "company-1/run-logs/early-close", contentType: "application/octet-stream",
+      body, contentLength: body.length, sha256: sha256(body) });
+    const closed = new Promise<void>(resolve => source.once("close", resolve));
+    for await (const chunk of await store.get(committed)) {
+      expect(Buffer.from(chunk).toString()).toBe("prefix");
+      break;
+    }
+    await closed;
+    expect(source.destroyed).toBe(true);
+    expect(metadata.markCorrupt).not.toHaveBeenCalled();
+  });
+
+  it("never deletes bytes committed by a concurrent orphan adopter", async () => {
+    const { store, provider, metadata } = fixture();
+    const deleted = vi.spyOn(provider, "deleteObject");
+    let reached!: () => void, release!: () => void;
+    const atCommit = new Promise<void>(resolve => { reached = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(metadata, "commit").mockImplementationOnce(async () => {
+      reached();
+      await resume;
+      throw Object.assign(new Error("metadata key already committed"), { code: "23505" });
+    });
+    const body = Buffer.from("shared archive");
+    const input = { companyId: "company-1", kind: "run_log" as const,
+      objectKey: "company-1/run-logs/adoption-race", contentType: "application/octet-stream",
+      body, contentLength: body.length, sha256: sha256(body) };
+    const first = store.put(input);
+    const rejected = expect(first).rejects.toThrow("metadata key already committed");
+    try {
+      await atCommit;
+      const adopted = await store.put(input);
+      release();
+      await rejected;
+      expect(await buffer(await store.get(adopted))).toEqual(body);
+      expect(deleted).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await first.catch(() => undefined);
+    }
+  });
+
+  it("rejects a silently destroyed source instead of hanging its verifier", async () => {
+    const source = new Readable({ read() { this.destroy(); } });
+    const { store, metadata } = fixture({ async getObject() { return { stream: source }; } });
+    const body = Buffer.from("bytes");
+    const committed = await store.put({ companyId: "company-1", kind: "run_log",
+      objectKey: "company-1/run-logs/premature-close", contentType: "application/octet-stream",
+      body, contentLength: body.length, sha256: sha256(body) });
+    await expect(buffer(await store.get(committed))).rejects.toThrow("source closed before end");
+    expect(metadata.markCorrupt).not.toHaveBeenCalled();
+  });
+
 });

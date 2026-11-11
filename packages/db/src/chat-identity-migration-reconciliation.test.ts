@@ -22,91 +22,130 @@ import {
 // 0240–0245 execution-identity chain. These are the exact original SQL hashes,
 // not hashes of regenerated DDL: the interaction migration also repairs data
 // and must never run again just because its filename moved.
-// The next upstream chain occupies0246–0254. Chat files now use0255–0268;
+// The upstream chain occupies 0246–0254. Chat files now use 0255–0268;
 // historical data-repair audit labels remain byte-identical.
 const chatMigrations = [
   [
-    "0262_previous_captain_america",
+    "0255_previous_captain_america",
     "2cbd1eb88d3bf4c82b72fdfd78dce72ecd7899f85607a76fb7e40b2749fffa00",
     1788580015986,
   ],
   [
-    "0263_married_king_cobra",
+    "0256_married_king_cobra",
     "f352a8769496412df3be35050df02110714af3a189d92b3c2ac8d097e2612c7b",
     1788581746772,
   ],
   [
-    "0264_bizarre_the_hunter",
+    "0257_bizarre_the_hunter",
     "4e4636a22fb06aac55a998a0c98d043ec70083c198c94a0f5e0a99f18a1debac",
     1788582768429,
   ],
   [
-    "0265_typical_sauron",
+    "0258_typical_sauron",
     "f3cb8b9d3bb3691d98a830c7ba8b4f49bbe9bb01ce2e899583d0b5c9b84d423c",
     1788585030341,
   ],
   [
-    "0266_tan_chat",
+    "0259_tan_chat",
     "91012c36bfcf66615b537ce808c9cb2f1311bc6efa6aab3ed8afd0d01298af75",
     1788673647823,
   ],
   [
-    "0267_chat_interaction_wakeup_idempotency",
+    "0260_chat_interaction_wakeup_idempotency",
     "5e181169a724173d17865d537bd84c385e97e6f78e71aa795cad91734cd37ea0",
     1788688205087,
   ],
   [
-    "0268_faulty_iceman",
+    "0261_faulty_iceman",
     "dd7a7571e080471148cff98d1138ddd046e8c1e3c256fa5bc11564d5f4766c28",
     1788704871875,
   ],
   [
-    "0269_lying_avengers",
+    "0262_lying_avengers",
     "59909e4edae56117c7fe0af28aa10fe30a64d151e83fe6e06debcec90658ff09",
     1788708784607,
   ],
   [
-    "0270_nebulous_iron_lad",
+    "0263_nebulous_iron_lad",
     "858eb11c0863e361c1ae6995e78ca365f8002e35dcb1e89dbcc8bf65dea879e3",
     1788714691806,
   ],
   [
-    "0271_cynical_hellcat",
+    "0264_cynical_hellcat",
     "d9aeacc58ae3c52d34bf50f8ea38f55435a6f8f66dc6ee87d3b78e105a86602a",
     1788793844054,
   ],
   [
-    "0272_chat_interaction_wakeup_provenance",
+    "0265_chat_interaction_wakeup_provenance",
     "1547e6e597b50c621691ead1d25624c4bf94ca3259cf24ea4480f3fb915dd849",
     1788880065244,
   ],
   [
-    "0273_brave_living_mummy",
+    "0266_brave_living_mummy",
     "7c38ccd2fa6a9bde19d62b111f892bcabae9a8eabe5f8bf438f73a407016b56a",
     1788930085103,
   ],
   [
-    "0274_warm_wild_child",
+    "0267_warm_wild_child",
     "6902ea71d481a26d6359c6c9b149ff0c8a388e65356b066b2fbaa33622a6c9b8",
     1788934048647,
   ],
   [
-    "0275_lively_runaways",
+    "0268_lively_runaways",
     "20ebd2ac15d9b467abcc5552901ecf592b38499942b3eae7d593c79fd89bd0a8",
     1788942847296,
   ],
 ] as const;
 
+// Fork-only migrations retain their deployed SQL hashes and timestamps.
+const forkMigrations = [
+  [
+    "0345_heartbeat_runs_issue_lookup_idx",
+    "01d840c0a93ffaa8a812b53157e70f7ff5c760987b1f8a3d62c5c2d8b1cdc0ff",
+    1784485200000,
+  ],
+  [
+    "0346_cost_events_cache_creation_tokens",
+    "6de53f3403cc497907eb44422d335c01b51fd9bbbd3f6808fca5793bffa7dbce",
+    1785189900000,
+  ],
+  [
+    "0347_cost_events_company_issue_idx",
+    "e0ba0cc04ebdac278f5aa5aa2c63e7d38d18dfa5951a3ab6662e31ecf9165c8e",
+    1787412148133,
+  ],
+  [
+    "0348_heartbeat_runs_paperclip_issue_idx",
+    "e880957157b23aa425ef1ad73a5d4630c799bdea01235c0ab546cfdd7e98a014",
+    1787412148134,
+  ],
+  [
+    "0349_true_warstar",
+    "806984ab6b1f5d4001ce357fabfa3dfc732f98351a577d050f032e41362bc5f5",
+    1787664241828,
+  ],
+  [
+    "0350_heartbeat_run_ownership_fencing",
+    "27cd7bf786bf5379594d26662362154dfbe93197bd93702e5c5f0e92aadad4c8",
+    1787845455766,
+  ],
+  [
+    "0351_condemned_shooting_star",
+    "307d54cd025c3f13a6cee742bd637e101123f4eae0d61a3bed46046dcbfc50f9",
+    1787862297900,
+  ],
+] as const;
+
 const identityMigrations = [
-  "0247_pink_fantastic_four.sql",
-  "0248_conscious_adam_destine.sql",
-  "0249_wide_lightspeed.sql",
-  "0250_sleepy_metal_master.sql",
-  "0251_organic_meltdown.sql",
-  "0252_misty_nightshade.sql",
+  "0240_pink_fantastic_four.sql",
+  "0241_conscious_adam_destine.sql",
+  "0242_wide_lightspeed.sql",
+  "0243_sleepy_metal_master.sql",
+  "0244_organic_meltdown.sql",
+  "0245_misty_nightshade.sql",
 ];
 
-const provenanceMigration = "0272_chat_interaction_wakeup_provenance.sql";
+const provenanceMigration = "0265_chat_interaction_wakeup_provenance.sql";
 const legacyProvenance = "0245_chat_interaction_wakeup_idempotency";
 const canonicalProvenance = "0251_chat_interaction_wakeup_idempotency";
 
@@ -134,7 +173,19 @@ describe("chat and execution identity migration reconciliation", () => {
     }
   });
 
-  it("keeps canonical identity history in every regenerated chat checkpoint", async () => {
+  it("preserves deployed fork-only SQL hashes and timestamps after upstream renumbering", async () => {
+    const journal = JSON.parse(
+      await readFile(new URL("./migrations/meta/_journal.json", import.meta.url), "utf8"),
+    );
+    for (const [tag, hash, when] of forkMigrations) {
+      expect(await migrationHash(`${tag}.sql`), tag).toBe(hash);
+      expect(journal.entries.find((entry: { tag: string }) => entry.tag === tag)).toMatchObject({
+        idx: Number(tag.slice(0, 4)), tag, when,
+      });
+    }
+  });
+
+  it("keeps the identity and chat migrations in their reconciled journal order", async () => {
     const journal = JSON.parse(
       await readFile(
         new URL("./migrations/meta/_journal.json", import.meta.url),
@@ -144,119 +195,17 @@ describe("chat and execution identity migration reconciliation", () => {
     expect(
       journal.entries
         .filter(
-          (entry: { idx: number }) => entry.idx >= 247 && entry.idx <= 252,
+          (entry: { idx: number }) => entry.idx >= 240 && entry.idx <= 245,
         )
         .map((entry: { tag: string }) => `${entry.tag}.sql`),
     ).toEqual(identityMigrations);
     expect(
       journal.entries
         .filter(
-          (entry: { idx: number }) => entry.idx >= 262 && entry.idx <= 275,
+          (entry: { idx: number }) => entry.idx >= 255 && entry.idx <= 268,
         )
         .map((entry: { tag: string }) => entry.tag),
     ).toEqual(chatMigrations.map(([tag]) => tag));
-    let previous = JSON.parse(
-      await readFile(
-        new URL("./migrations/meta/0261_snapshot.json", import.meta.url),
-        "utf8",
-      ),
-    );
-    for (let step = 0; step < chatMigrations.length; step++) {
-      const index = String(262 + step).padStart(4, "0");
-      const current = JSON.parse(
-        await readFile(
-          new URL(`./migrations/meta/${index}_snapshot.json`, import.meta.url),
-          "utf8",
-        ),
-      );
-      expect(current.prevId, index).toBe(previous.id);
-      expect(current.tables["public.run_identity_contexts"], index).toEqual(
-        previous.tables["public.run_identity_contexts"],
-      );
-      expect(
-        current.tables["public.heartbeat_runs"].columns
-          .active_identity_context_id,
-        index,
-      ).toBeDefined();
-      expect(
-        current.tables["public.issues"].columns.origin_identity_context_id,
-        index,
-      ).toBeDefined();
-      expect(
-        current.tables["public.issues"].columns
-          .continuation_identity_context_id,
-        index,
-      ).toBeDefined();
-      expect(
-        current.tables["public.issue_thread_interactions"].columns
-          .source_identity_context_id,
-        index,
-      ).toBeDefined();
-      expect(
-        Boolean(
-          current.tables["public.chat_conversations"].columns
-            .session_generation,
-        ),
-        index,
-      ).toBe(step >= 1);
-      expect(
-        Boolean(
-          current.tables["public.chat_endpoints"].indexes
-            .chat_endpoints_live_bot_external_uq,
-        ),
-        index,
-      ).toBe(step >= 2);
-      expect(
-        current.tables[
-          "public.chat_publications"
-        ].checkConstraints.chat_publications_state_check.value.includes(
-          "delivery_unknown",
-        ),
-        index,
-      ).toBe(step >= 3);
-      expect(
-        current.tables["public.chat_endpoints"].columns.allow_group_chats
-          .default,
-        index,
-      ).toBe(step < 4);
-      expect(
-        current.tables[
-          "public.agent_wakeup_requests"
-        ].indexes.agent_wakeup_requests_question_response_delivery_idempotency_uq.where.includes(
-          "interaction:%",
-        ),
-        index,
-      ).toBe(step >= 5);
-      expect(
-        current.tables[
-          "public.chat_endpoints"
-        ].checkConstraints.chat_endpoints_provider_check.value.includes(
-          "discord",
-        ),
-        index,
-      ).toBe(step >= 6);
-      expect(
-        Boolean(
-          current.tables["public.chat_endpoints"].indexes
-            .chat_endpoints_live_discord_bot_external_uq,
-        ),
-        index,
-      ).toBe(step >= 7);
-      expect(
-        Boolean(
-          current.tables["public.chat_endpoints"].indexes
-            .chat_endpoints_live_global_app_bot_external_uq,
-        ),
-        index,
-      ).toBe(step >= 8);
-      expect(
-        Boolean(
-          current.tables["public.issue_attachments"].columns.originating_run_id,
-        ),
-        index,
-      ).toBe(step >= 9);
-      previous = current;
-    }
   });
 });
 
@@ -355,7 +304,7 @@ const support = await getEmbeddedPostgresTestSupport();
             },
             {
               name: "unrelated migration",
-              dedupe: { ...retired, migration: "0252_misty_nightshade" },
+              dedupe: { ...retired, migration: "0245_misty_nightshade" },
               error: oldLine,
             },
             { name: "array metadata", dedupe: [retired] },
@@ -569,6 +518,73 @@ const support = await getEmbeddedPostgresTestSupport();
 );
 
 (support.supported ? describe : describe.skip)(
+  "heartbeat issue index identity reconciliation",
+  () => {
+    it("converges fresh, deployed fork, duplicate-expression, and missing-index catalogs without rebuilding the deployed expression index", async () => {
+      const database = await startEmbeddedPostgresTestDatabase("paperclip-index-identity-");
+      const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
+      const indexes = () => sql`
+        SELECT c.oid::text AS oid, c.relname AS name, pg_get_indexdef(c.oid) AS definition
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname IN (
+          'heartbeat_runs_company_issue_created_idx',
+          'heartbeat_runs_company_ctx_issue_created_id_idx',
+          'heartbeat_runs_company_ctx_issue_created_idx'
+        ) ORDER BY c.relname`;
+      try {
+        const canonical = await indexes();
+        expect(canonical).toHaveLength(3);
+        expect(canonical.find((row) => row.name === "heartbeat_runs_company_issue_created_idx")?.definition)
+          .toContain("(company_id, issue_id, created_at)");
+        expect(canonical.find((row) => row.name === "heartbeat_runs_company_ctx_issue_created_id_idx")?.definition)
+          .toContain("created_at DESC, id DESC)");
+        const existingThreeKey = canonical.find((row) => row.name === "heartbeat_runs_company_ctx_issue_created_idx");
+        for (const state of ["fresh", "fork", "duplicate-expression", "missing"] as const) {
+          await sql`DROP INDEX public.heartbeat_runs_company_issue_created_idx`;
+          await sql`DROP INDEX public.heartbeat_runs_company_ctx_issue_created_id_idx`;
+          if (state === "fresh") {
+            await sql`CREATE INDEX heartbeat_runs_company_issue_created_idx ON public.heartbeat_runs (company_id, issue_id, created_at)`;
+          } else if (state !== "missing") {
+            await sql`CREATE INDEX heartbeat_runs_company_issue_created_idx ON public.heartbeat_runs (company_id, (context_snapshot->>'issueId'), created_at DESC, id DESC)`;
+          }
+          if (state === "duplicate-expression") {
+            await sql`CREATE INDEX heartbeat_runs_company_ctx_issue_created_id_idx ON public.heartbeat_runs (company_id, (context_snapshot->>'issueId'), created_at DESC, id DESC)`;
+          }
+          const before = await indexes();
+          await executeMigration(sql, "0352_heartbeat_issue_index_identity.sql");
+          const after = await indexes();
+          expect(after.map(({ name, definition }) => ({ name, definition })), state)
+            .toEqual(canonical.map(({ name, definition }) => ({ name, definition })));
+          expect(after.find((row) => row.name === existingThreeKey!.name), state).toEqual(existingThreeKey);
+          if (state === "fork") {
+            expect(after.find((row) => row.name === "heartbeat_runs_company_ctx_issue_created_id_idx")?.oid)
+              .toBe(before.find((row) => row.name === "heartbeat_runs_company_issue_created_idx")?.oid);
+          } else if (state === "duplicate-expression") {
+            expect(after.find((row) => row.name === "heartbeat_runs_company_ctx_issue_created_id_idx")?.oid)
+              .toBe(before.find((row) => row.name === "heartbeat_runs_company_ctx_issue_created_id_idx")?.oid);
+          }
+          await executeMigration(sql, "0352_heartbeat_issue_index_identity.sql");
+          expect(await indexes(), state).toEqual(after);
+        }
+        // Validate both names before any rename/drop, including a conflicting new name.
+        for (const unknownName of ["heartbeat_runs_company_issue_created_idx", "heartbeat_runs_company_ctx_issue_created_id_idx"]) {
+          await sql.unsafe(`DROP INDEX public.${unknownName}`);
+          await sql.unsafe(`CREATE INDEX ${unknownName} ON public.heartbeat_runs (company_id)`);
+          const before = await indexes();
+          await expect(executeMigration(sql, "0352_heartbeat_issue_index_identity.sql")).rejects.toThrow(/unknown definition/);
+          expect(await indexes()).toEqual(before);
+          await sql.unsafe(`DROP INDEX public.${unknownName}`);
+          await executeMigration(sql, "0352_heartbeat_issue_index_identity.sql");
+        }
+      } finally {
+        await sql.end();
+        await database.cleanup();
+      }
+    }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+  },
+);
+
+(support.supported ? describe : describe.skip)(
   "chat identity migration upgrade",
   () => {
     it(
@@ -608,20 +624,20 @@ const support = await getEmbeddedPostgresTestSupport();
           }>;
           const priorEntries = entries
             .filter(
-              (entry) => entry.idx < 253 || (entry.idx >= 262 && entry.idx <= 275),
+              (entry) => entry.idx < 246 || (entry.idx >= 255 && entry.idx <= 268) || forkMigrations.some(([tag]) => tag === entry.tag),
             )
             .map((entry, index) => ({
               ...entry,
               idx: index,
               // Exact immutable007 chat-history timestamps. Filenames are not
               // persisted by Drizzle; the SQL hash and applied time are.
-              when: entry.idx < 262 ? entry.when : [
+              when: entry.idx < 255 || entry.idx > 268 ? entry.when : [
                 1788832469741, 1788832471197, 1788832472637,
                 1788832474071, 1788832475492, 1788832476957,
                 1788832478340, 1788832479792, 1788832481237,
                 1788832482645, 1788880065244, 1788930085103,
                 1788934048647, 1788942847296,
-              ][entry.idx - 262]!,
+              ][entry.idx - 255]!,
             }));
           expect(priorEntries.every((entry) => Number.isFinite(entry.when))).toBe(true);
           await mkdir(join(directory, "meta"));
@@ -660,12 +676,10 @@ const support = await getEmbeddedPostgresTestSupport();
             await legacy`SELECT row_to_json(p) AS row FROM chat_publications p ORDER BY id`;
           const historyBefore =
             await legacy`SELECT id,hash,created_at::text FROM drizzle.__drizzle_migrations ORDER BY id`;
+          const priorTags = new Set(priorEntries.map((entry) => entry.tag));
           const pending = entries
-            .filter(
-              (entry) => (entry.idx >= 253 && entry.idx <= 261) || entry.idx > 275,
-            )
+            .filter((entry) => !priorTags.has(entry.tag))
             .map((entry) => `${entry.tag}.sql`);
-          expect(pending).toHaveLength(9 + entries.filter((entry) => entry.idx > 275).length);
           expect(await inspectMigrations(legacyUrl.href)).toMatchObject({
             status: "needsMigrations",
             pendingMigrations: pending,

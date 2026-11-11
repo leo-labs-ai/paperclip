@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { ObjectStore } from "./object-store.js";
+import { Readable } from "node:stream";
 import type { StorageService, StorageProvider, PutFileInput, PutFileResult } from "./types.js";
 import { badRequest, forbidden, unprocessable } from "../errors.js";
 
@@ -80,10 +81,13 @@ function assertPutFileInput(input: PutFileInput): void {
   if (!input.contentType || input.contentType.trim().length === 0) {
     throw unprocessable("contentType is required");
   }
-  if (!(input.body instanceof Buffer)) {
-    throw unprocessable("body must be a Buffer");
+  if (!(input.body instanceof Buffer) && !(input.body instanceof Readable)) {
+    throw unprocessable("body must be a Buffer or Readable");
   }
-  if (input.body.length <= 0) {
+  if (!Buffer.isBuffer(input.body) && (!("byteSize" in input) || !Number.isSafeInteger(input.byteSize) || input.byteSize < 0 || !/^[0-9a-f]{64}$/.test(input.sha256))) {
+    throw unprocessable("Streamed files require an exact byte size and SHA-256");
+  }
+  if (("byteSize" in input ? input.byteSize : input.body.length) <= 0) {
     throw unprocessable("File is empty");
   }
 }
@@ -98,42 +102,54 @@ export function createStorageService(
 
     async putFile(input: PutFileInput): Promise<PutFileResult> {
       assertPutFileInput(input);
-      const objectKey = buildObjectKey(input.companyId, input.namespace, input.originalFilename);
-      const byteSize = input.body.length;
+      const objectKey = input.objectKey ?? buildObjectKey(input.companyId, input.namespace, input.originalFilename);
+      ensureCompanyPrefix(input.companyId, objectKey);
+      const byteSize = "byteSize" in input ? input.byteSize : input.body.length;
       const contentType = input.contentType.trim().toLowerCase();
-      const sha256 = hashBuffer(input.body);
+      const sha256 = "sha256" in input ? input.sha256 : hashBuffer(input.body);
       if (input.durableKind && provider.shared && !durableStore) {
         throw new Error("Durable object metadata store is not configured");
       }
-      const durableObject = input.durableKind && provider.shared
-        ? await durableStore!.put({
-            companyId: input.companyId,
-            kind: input.durableKind,
-            objectKey,
-            contentType,
-            body: input.body,
-            contentLength: byteSize,
-            sha256,
-          })
-        : undefined;
-      if (!durableObject) {
-        await provider.putObject({
-          objectKey,
-          body: input.body,
-          contentType,
-          contentLength: byteSize,
-        });
-      }
+      try {
+        const durableObject = input.durableKind && provider.shared
+          ? await durableStore!.put({
+              companyId: input.companyId,
+              kind: input.durableKind,
+              objectKey,
+              contentType,
+              body: input.body,
+              contentLength: byteSize,
+              sha256,
+            })
+          : undefined;
+        if (!durableObject) {
+          try {
+            await provider.putObject({
+              objectKey,
+              body: input.body,
+              contentType,
+              contentLength: byteSize,
+            });
+          } catch (error) {
+            // Only clean up keys allocated by this call. An explicit key may
+            // belong to an earlier retry; durable cleanup is version-aware.
+            if (!input.objectKey) await provider.deleteObject({ objectKey }).catch(() => {});
+            throw error;
+          }
+        }
 
-      return {
-        provider: provider.id,
-        objectKey,
-        contentType,
-        byteSize,
-        sha256,
-        originalFilename: input.originalFilename,
-        durableObject,
-      };
+        return {
+          provider: provider.id,
+          objectKey,
+          contentType,
+          byteSize,
+          sha256,
+          originalFilename: input.originalFilename,
+          durableObject,
+        };
+      } finally {
+        if (input.body instanceof Readable) input.body.destroy();
+      }
     },
 
     async getObject(companyId: string, objectKey: string, options) {
@@ -147,7 +163,7 @@ export function createStorageService(
         }
         if (!options?.range) {
           return {
-            stream: await durableStore!.get(metadata),
+            stream: await durableStore!.get(metadata, options),
             contentType: metadata.contentType,
             contentLength: metadata.byteSize,
             etag: metadata.etag ?? undefined,
@@ -159,6 +175,7 @@ export function createStorageService(
         objectKey,
         version: metadata?.version ?? undefined,
         range: options?.range,
+        ...(options?.signal ? { signal: options.signal } : {}),
       });
     },
 

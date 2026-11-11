@@ -1,3 +1,4 @@
+import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
@@ -9,6 +10,8 @@ import {
   agentWakeupRequests,
   agents,
   companies,
+  authUsers,
+  companyMemberships,
   completionContracts,
   createDb,
   executionWorkspaces,
@@ -40,6 +43,7 @@ import {
 } from "../vendor/paperclip-runner/testing.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { waitForPendingRunFailureReports } from "../services/run-failure-report.js";
 import {
   claimNativeSessionResumptions,
   dispatchNativeSessionResumptions,
@@ -259,7 +263,7 @@ describe("P6-25 pre-result native session recovery", () => {
         leaseExpiresAt: new Date(0),
       })),
     ]);
-  }, 30_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterAll(async () => temporary?.cleanup());
 
@@ -563,13 +567,11 @@ describe("P6-25 pre-result native session recovery", () => {
     const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
 
     await claimNativeSessionResumptions({ db, runnerInstanceId: "reaper", runIds: [freshRunId] });
-    // The Sentry report fires without an await inside the reconciler, so a
-    // follow-up round trip to the real database gives that fire-and-forget
-    // call room to complete before this test reads the spy.
-    await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, freshRunId));
-
+    // The reconciler reports asynchronously; an unrelated database round trip
+    // does not guarantee that callback has completed.
+    await waitForPendingRunFailureReports();
+    expect(mockCaptureRunFailure.mock.calls.slice(captureCallsBefore)).toHaveLength(1);
     const newCaptures = mockCaptureRunFailure.mock.calls.slice(captureCallsBefore);
-    expect(newCaptures).toHaveLength(1);
     expect(newCaptures[0]?.[0]).toMatchObject({ runId: freshRunId, runStatus: "failed" });
   });
 
@@ -601,7 +603,7 @@ describe("P6-25 pre-result native session recovery", () => {
     const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
 
     await claimNativeSessionResumptions({ db, runnerInstanceId: "reaper", runIds: [freshRunId] });
-    await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, freshRunId));
+    await waitForPendingRunFailureReports();
 
     expect(mockCaptureRunFailure.mock.calls.slice(captureCallsBefore)).toHaveLength(0);
   });
@@ -796,6 +798,8 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
         status: "active",
         defaultResponsibleUserId: "responsible-user",
       });
+      await db.insert(authUsers).values({ id: "responsible-user", name: "Fixture user", email: "responsible-user@example.test", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+      await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
       await db
         .insert(projects)
         .values({
@@ -953,7 +957,7 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
           authorUserId: "responsible-user",
           body: "Verify the newest user instruction before completing this task.",
         });
-    }, 30_000);
+    }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
     afterAll(async () => {
       if (
@@ -1392,6 +1396,11 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
         status: "in_progress",
         assigneeAgentId: agentId,
         workMode: "standard",
+      });
+      const directExecute = legacyAdapterExecute.getMockImplementation()!;
+      legacyAdapterExecute.mockImplementationOnce(async () => {
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, freshIssueId));
+        return directExecute();
       });
       const fresh = await heartbeat.wakeup(agentId, {
         source: "automation",

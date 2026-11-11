@@ -156,6 +156,7 @@ export function healthRoutes(
     serverInfo?: ServerInfoSnapshot;
     databaseBackupHealth?: InspectDatabaseBackupHealthOptions;
     runtimeEnv?: CloudInstanceEnv;
+    isWarmStandby?: () => boolean;
     /**
      * Dedicated single-connection client for the DB probe. With it, main-pool
      * starvation no longer equals probe failure: the probe answers from its
@@ -352,6 +353,23 @@ export function healthRoutes(
               ...(hiddenSettings.length ? { hiddenSettings } : {}),
             },
       );
+      return;
+    }
+
+    // Startup has already validated the empty database. During warm standby,
+    // readiness means the HTTP app can accept a signed claim; probing SQL would
+    // keep the idle database awake. The claim itself still performs durable SQL,
+    // and claimed instances retain the normal live database check below.
+    if (opts.isWarmStandby?.()) {
+      res.json({
+        status: healthStatus,
+        deploymentMode: opts.deploymentMode,
+        deploymentExposure: opts.deploymentExposure,
+        commit,
+        warmStandby: true,
+        ...(cloud ? { cloud } : {}),
+        ...(hiddenSettings.length ? { hiddenSettings } : {}),
+      });
       return;
     }
 

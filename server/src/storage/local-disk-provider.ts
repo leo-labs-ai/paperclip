@@ -94,7 +94,7 @@ export function createLocalDiskStorageProvider(baseDir: string): StorageProvider
         ? input.range.end - input.range.start + 1
         : stat.size;
       return {
-        stream: createReadStream(filePath, streamOptions),
+        stream: createReadStream(filePath, { ...streamOptions, signal: input.signal }),
         contentLength,
         lastModified: stat.mtime,
       };

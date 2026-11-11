@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
   activityLog,
@@ -24,9 +24,19 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+// Observe the Cloud lifecycle doorbell without any network: the real
+// implementation is env-gated (a no-op off Cloud), so these tests assert
+// WHEN the service rings it, not what the ring does.
+const notifyCloudSpy = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock("../services/cloud-lifecycle-sync.js", () => ({
+  isCloudPinnedPrimaryCompany: () => false,
+  notifyCloudOfPrimaryCompanyLifecycleChange: notifyCloudSpy,
+}));
+
+import { configureAgentLifecycle } from "../services/agent-lifecycle.js";
 import { companyService } from "../services/companies.js";
 import { deriveIssuePrefixBase } from "../services/issue-prefix.js";
-import { readBuiltInAgentMarker } from "../services/built-in-agent-metadata.js";
+import { readBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
 import { builtInAgentService, reconcileBuiltInAgentsOnStartup } from "../services/built-in-agents.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -40,6 +50,16 @@ if (!embeddedPostgresSupport.supported) {
 
 describeEmbeddedPostgres("companyService", () => {
   let db!: ReturnType<typeof createDb>;
+  let lifecycleWorker: ReturnType<typeof configureAgentLifecycle>;
+  beforeEach(() => { lifecycleWorker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" }); });
+  async function insertAgents(input: typeof agents.$inferInsert | Array<typeof agents.$inferInsert>) {
+    const rows = Array.isArray(input) ? input : [input];
+    await db.insert(agents).values(rows.map(row => ({ ...row,
+      lifecycleState: ["paused", "pending_approval", "terminated"].includes(row.status ?? "") ? row.status! : "ready",
+      lifecycleHolds: row.status === "paused" ? [row.pauseReason ?? "manual"] : [],
+    })));
+  }
+
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
@@ -48,6 +68,7 @@ describeEmbeddedPostgres("companyService", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await lifecycleWorker.stop();
     await db.delete(routineTriggers);
     await db.delete(routines);
     await db.delete(builtInManagedResources);
@@ -156,7 +177,7 @@ describeEmbeddedPostgres("companyService", () => {
       requireBoardApprovalForNewAgents: false,
     });
 
-    await db.insert(agents).values([
+    await insertAgents([
       {
         id: runningAgentId,
         companyId,
@@ -326,7 +347,7 @@ describeEmbeddedPostgres("companyService", () => {
       requireBoardApprovalForNewAgents: false,
     });
 
-    await db.insert(agents).values([
+    await insertAgents([
       {
         id: archivedPausedAgentId,
         companyId,
@@ -373,6 +394,7 @@ describeEmbeddedPostgres("companyService", () => {
     );
 
     expect(reactivated?.status).toBe("active");
+    await lifecycleWorker.process(archivedPausedAgentId);
 
     const reactivateActivity = await db
       .select({
@@ -432,7 +454,7 @@ describeEmbeddedPostgres("companyService", () => {
       requireBoardApprovalForNewAgents: false,
     });
 
-    await db.insert(agents).values([
+    await insertAgents([
       {
         id: runningAgentId,
         companyId,
@@ -542,7 +564,7 @@ describeEmbeddedPostgres("companyService", () => {
       requireBoardApprovalForNewAgents: false,
     });
 
-    await db.insert(agents).values([
+    await insertAgents([
       {
         id: archivedPausedAgentId,
         companyId,
@@ -578,6 +600,7 @@ describeEmbeddedPostgres("companyService", () => {
     );
 
     expect(reactivated?.status).toBe("active");
+    await lifecycleWorker.process(archivedPausedAgentId);
 
     const rows = await db
       .select({ id: agents.id, status: agents.status, pauseReason: agents.pauseReason })
@@ -609,7 +632,7 @@ describeEmbeddedPostgres("companyService", () => {
       requireBoardApprovalForNewAgents: false,
     });
 
-    await db.insert(agents).values({
+    await insertAgents({
       id: terminatedAgentId,
       companyId,
       name: "Terminated Agent",
@@ -652,7 +675,7 @@ describeEmbeddedPostgres("companyService", () => {
       requireBoardApprovalForNewAgents: false,
     });
 
-    await db.insert(agents).values({
+    await insertAgents({
       id: manualPausedAgentId,
       companyId,
       name: "Manual Paused Agent",
@@ -704,7 +727,7 @@ describeEmbeddedPostgres("companyService", () => {
       requireBoardApprovalForNewAgents: false,
     });
 
-    await db.insert(agents).values({
+    await insertAgents({
       id: agentId,
       companyId,
       name: "Idle Agent",
@@ -779,7 +802,7 @@ describeEmbeddedPostgres("companyService", () => {
       requireBoardApprovalForNewAgents: false,
     });
 
-    await db.insert(agents).values({
+    await insertAgents({
       id: agentId,
       companyId,
       name: "Idle Agent",
@@ -809,6 +832,38 @@ describeEmbeddedPostgres("companyService", () => {
     expect(archiveActivity[0]).toMatchObject({ details: { agentsPaused: 1, runsCancelled: 0 } });
   });
 
+  it("rings the Cloud lifecycle doorbell exactly on archived-boundary transitions", async () => {
+    notifyCloudSpy.mockClear();
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Doorbell Test Co",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const svc = companyService(db);
+    const actor = { actorType: "user" as const, actorId: "test-user", agentId: null, runId: null };
+
+    // A plain edit never rings.
+    await svc.update(companyId, { name: "Doorbell Test Co (renamed)" }, actor);
+    expect(notifyCloudSpy).not.toHaveBeenCalled();
+
+    // archive() rings once; re-archiving (no transition) does not.
+    await svc.archive(companyId, actor);
+    expect(notifyCloudSpy).toHaveBeenCalledTimes(1);
+    expect(notifyCloudSpy).toHaveBeenLastCalledWith(companyId);
+    await svc.archive(companyId, actor);
+    expect(notifyCloudSpy).toHaveBeenCalledTimes(1);
+
+    // Unarchiving through update() rings again.
+    await svc.update(companyId, { status: "active" }, actor);
+    expect(notifyCloudSpy).toHaveBeenCalledTimes(2);
+
+    // update() into archived rings too (the status-patch archive path).
+    await svc.update(companyId, { status: "archived" }, actor);
+    expect(notifyCloudSpy).toHaveBeenCalledTimes(3);
+  });
+
   it("runs the archive cascade when update() transitions a paused company to archived", async () => {
     const companyId = randomUUID();
     const idleAgentId = randomUUID();
@@ -822,7 +877,7 @@ describeEmbeddedPostgres("companyService", () => {
       requireBoardApprovalForNewAgents: false,
     });
 
-    await db.insert(agents).values({
+    await insertAgents({
       id: idleAgentId,
       companyId,
       name: "Idle Agent",

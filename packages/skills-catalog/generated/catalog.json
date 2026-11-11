@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/skills-catalog",
   "packageVersion": "0.3.1",
-  "generatedAt": "2026-08-11T15:05:34.526Z",
+  "generatedAt": "2026-10-06T01:21:47.421Z",
   "skills": [
     {
       "id": "paperclipai:bundled:docs:doc-maintenance",
@@ -185,7 +185,7 @@
       "category": "paperclip-operations",
       "slug": "task-planning",
       "name": "task-planning",
-      "description": "Turn a Paperclip issue or request into a structured implementation plan with child task graph, blockers, owners, and acceptance criteria, then save it as the issue `plan` document.",
+      "description": "Write or revise a useful Paperclip plan with a clear outcome and verification. Use when a plan is requested or uncertainty needs resolving before execution.",
       "path": "catalog/bundled/paperclip-operations/task-planning",
       "entrypoint": "SKILL.md",
       "trustLevel": "markdown_only",
@@ -207,11 +207,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 4938,
-          "sha256": "9c52a44a30ec8d306119da51bf298e9e3e6c382a9a9559ffd3054bf5e0c75f36"
+          "sizeBytes": 1707,
+          "sha256": "31cccfce6e2086179054a506f5f2cb53426d58bc46021e8abb7366c84c9749f8"
         }
       ],
-      "contentHash": "sha256:487c3116eead89fef4f71c984329c41836bd69951b7ef9ed8736c69435e02438"
+      "contentHash": "sha256:6f1925c2217980d32d34127cf493de471f3fb0c24ea5523eeec179c1c765d6f5"
     },
     {
       "id": "paperclipai:bundled:product:paperclip-capsules",

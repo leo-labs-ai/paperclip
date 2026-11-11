@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Readable, Transform } from "node:stream";
+import { addAbortSignal, Readable, Transform } from "node:stream";
 import { and, eq } from "drizzle-orm";
 import {
   durableObjects,
@@ -60,6 +60,7 @@ function createIntegrityStream(
   source: Readable,
   metadata: DurableObjectMetadata,
   markCorrupt: (reason: string) => Promise<void>,
+  signal?: AbortSignal,
 ): Readable {
   const hash = createHash("sha256");
   let bytes = 0;
@@ -81,6 +82,22 @@ function createIntegrityStream(
         .finally(() => callback(new Error("Durable object integrity check failed")));
     },
   });
+  // pipe alone does not forward source errors or stop the source when a
+  // paginated reader destroys its verifier early. Preserve full-read integrity
+  // checks, but do not misclassify cancellation/network failures as corruption.
+  const forwardError = (error: Error) => verifier.destroy(error);
+  source.once("error", forwardError);
+  source.once("close", () => {
+    source.off("error", forwardError);
+    if (!source.readableEnded && !verifier.destroyed) {
+      verifier.destroy(new Error("Durable object source closed before end"));
+    }
+  });
+  verifier.once("close", () => {
+    source.unpipe(verifier);
+    source.destroy();
+  });
+  if (signal) addAbortSignal(signal, verifier);
   return source.pipe(verifier);
 }
 
@@ -88,7 +105,7 @@ export interface ObjectStore {
   shared: boolean;
   put(input: ObjectStorePutInput): Promise<DurableObjectMetadata>;
   find(objectKey: string): Promise<DurableObjectMetadata | null>;
-  get(metadata: DurableObjectMetadata): Promise<Readable>;
+  get(metadata: DurableObjectMetadata, options?: { signal?: AbortSignal }): Promise<Readable>;
   delete(metadata: DurableObjectMetadata): Promise<void>;
 }
 
@@ -175,46 +192,42 @@ export function createObjectStore(deps: {
         });
       }
 
-      let head;
-      try {
-        head = await deps.provider.headObject({
-          objectKey: input.objectKey,
-          version: upload.version,
-        });
-        if (!head.exists || head.contentLength !== input.contentLength) {
-          throw new Error("Durable object verification failed: length mismatch");
-        }
-        if (head.checksumSha256 && head.checksumSha256 !== checksumSha256) {
-          throw new Error("Durable object verification failed: checksum mismatch");
-        }
-
-        return await deps.metadata.commit({
-          companyId: input.companyId,
-          kind: input.kind,
-          provider: deps.provider.id,
-          backendId: deps.provider.backendId,
-          objectKey: input.objectKey,
-          contentType: input.contentType,
-          byteSize: input.contentLength,
-          sha256: input.sha256,
-          version: head.version ?? upload.version ?? null,
-          etag: head.etag ?? upload.etag ?? null,
-          verifiedAt: new Date(),
-        });
-      } catch (error) {
-        await deps.provider.deleteObject({
-          objectKey: input.objectKey,
-          version: head?.version ?? upload.version,
-        }).catch(() => undefined);
-        throw error;
+      // Conditional PUT publishes bytes that another retry may already adopt.
+      // A failed/uncertain metadata commit is not deletion authority: deleting
+      // here can destroy a concurrently committed object's exact version.
+      // Retain potential orphans for verified retry adoption instead.
+      const head = await deps.provider.headObject({
+        objectKey: input.objectKey,
+        version: upload.version,
+      });
+      if (!head.exists || head.contentLength !== input.contentLength) {
+        throw new Error("Durable object verification failed: length mismatch");
       }
+      if (head.checksumSha256 && head.checksumSha256 !== checksumSha256) {
+        throw new Error("Durable object verification failed: checksum mismatch");
+      }
+
+      return await deps.metadata.commit({
+        companyId: input.companyId,
+        kind: input.kind,
+        provider: deps.provider.id,
+        backendId: deps.provider.backendId,
+        objectKey: input.objectKey,
+        contentType: input.contentType,
+        byteSize: input.contentLength,
+        sha256: input.sha256,
+        version: head.version ?? upload.version ?? null,
+        etag: head.etag ?? upload.etag ?? null,
+        verifiedAt: new Date(),
+      });
     },
 
     async find(objectKey: string): Promise<DurableObjectMetadata | null> {
       return deps.metadata.find(deps.provider.backendId, objectKey);
     },
 
-    async get(metadata: DurableObjectMetadata): Promise<Readable> {
+    async get(metadata: DurableObjectMetadata, options?: { signal?: AbortSignal }): Promise<Readable> {
+      options?.signal?.throwIfAborted();
       if (metadata.backendId !== deps.provider.backendId) {
         throw new Error("Durable object belongs to a different storage backend");
       }
@@ -224,11 +237,17 @@ export function createObjectStore(deps: {
       const result = await deps.provider.getObject({
         objectKey: metadata.objectKey,
         version: metadata.version ?? undefined,
+        ...(options?.signal ? { signal: options.signal } : {}),
       });
+      if (options?.signal?.aborted) {
+        result.stream.destroy();
+        options.signal.throwIfAborted();
+      }
       return createIntegrityStream(
         result.stream,
         metadata,
         (reason) => deps.metadata.markCorrupt(metadata.id, reason),
+        options?.signal,
       );
     },
 

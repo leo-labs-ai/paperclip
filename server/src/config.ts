@@ -1,4 +1,4 @@
-import { readConfigFile } from "./config-file.js";
+import { readConfigFile, resolveDeploymentMode } from "./config-file.js";
 import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
 import { execFileSync } from "node:child_process";
 import {
@@ -7,11 +7,13 @@ import {
   resolveDefinedDatabaseUrl,
 } from "@paperclipai/db/runtime-config";
 import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "./worktree-config.js";
+import { basename, dirname } from "node:path";
+import { resolvePaperclipEnvPath } from "./paths.js";
+import { applyEmptyWorktreeSigningSecrets } from "./dev-runner-worktree.js";
 import {
   AUTH_BASE_URL_MODES,
   BIND_MODES,
   DEPLOYMENT_EXPOSURES,
-  DEPLOYMENT_MODES,
   SECRET_PROVIDERS,
   STORAGE_PROVIDERS,
   type BindMode,
@@ -34,6 +36,11 @@ import {
 } from "./home-paths.js";
 
 loadDatabaseEnvironment();
+const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
+
+if (basename(dirname(PAPERCLIP_ENV_FILE_PATH)) === ".paperclip") {
+  applyEmptyWorktreeSigningSecrets(dirname(dirname(PAPERCLIP_ENV_FILE_PATH)));
+}
 maybeRepairLegacyWorktreeConfigAndEnvFiles();
 
 const TAILSCALE_DETECT_TIMEOUT_MS = 3000;
@@ -261,12 +268,7 @@ export function loadConfig(): Config {
     process.env.PAPERCLIP_TELEMETRY_BACKEND_TOKEN?.trim() ||
     undefined;
 
-  const deploymentModeFromEnvRaw = process.env.PAPERCLIP_DEPLOYMENT_MODE;
-  const deploymentModeFromEnv =
-    deploymentModeFromEnvRaw && DEPLOYMENT_MODES.includes(deploymentModeFromEnvRaw as DeploymentMode)
-      ? (deploymentModeFromEnvRaw as DeploymentMode)
-      : null;
-  const deploymentMode: DeploymentMode = deploymentModeFromEnv ?? fileConfig?.server.deploymentMode ?? "local_trusted";
+  const deploymentMode = resolveDeploymentMode(fileConfig);
   const strictModeFromEnv = process.env.PAPERCLIP_SECRETS_STRICT_MODE;
   const secretsStrictMode =
     strictModeFromEnv !== undefined

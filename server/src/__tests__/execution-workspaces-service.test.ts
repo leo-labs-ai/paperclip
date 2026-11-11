@@ -1,3 +1,5 @@
+import * as localServiceSupervisor from "../services/local-service-supervisor.js";
+import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -265,7 +267,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       // tests further down.
       workspaceReaperCooldownDays: 0,
     });
-  }, 20_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
     await db.delete(workspaceRuntimeServices);
@@ -292,6 +294,104 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   afterAll(async () => {
     await tempDb?.cleanup();
   });
+
+  function insertBlockedSourceTask(issueId: string, companyId: string, projectId: string) {
+    return db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Source task",
+      status: "blocked",
+      priority: "medium",
+    });
+  }
+
+  function insertBoardWorkspaceRecovery(companyId: string, issueId: string, fingerprint: string) {
+    return db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "workspace_validation",
+      status: "active",
+      ownerType: "board",
+      cause: "workspace_validation_failed",
+      fingerprint,
+      evidence: {
+        workspaceValidation: {
+          fingerprint,
+        },
+      },
+      nextAction: "Repair the source issue workspace link.",
+    });
+  }
+
+  function insertMissingRecordedBranchWorkspace(executionWorkspaceId: string, companyId: string, projectId: string, issueId: string, worktreePath: string) {
+    return db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: issueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "feature/never-created",
+      status: "idle",
+      providerType: "git_worktree",
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      branchName: "feature/never-created",
+      baseRef: "main",
+    });
+  }
+
+  function insertRecordedBranchWorkspace(executionWorkspaceId: string, companyId: string, projectId: string, projectWorkspaceId: string, issueId: string, worktreePath: string) {
+    return db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      sourceIssueId: issueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "feature/recorded",
+      status: "active",
+      providerType: "git_worktree",
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      branchName: "feature/recorded",
+      baseRef: "main",
+    });
+  }
+
+  function insertRunningWorkspaceService(runtimeServiceId: string, companyId: string, projectId: string, executionWorkspaceId: string, issueId: string, worktreePath: string) {
+    return db.insert(workspaceRuntimeServices).values({
+      id: runtimeServiceId,
+      companyId,
+      projectId,
+      executionWorkspaceId,
+      issueId,
+      scopeType: "execution_workspace",
+      serviceName: "web",
+      status: "running",
+      lifecycle: "shared",
+      command: "pnpm dev",
+      cwd: worktreePath,
+      provider: "local_process",
+      healthStatus: "healthy",
+    });
+  }
+
+  function insertActiveCodexCoder(agentId: string, companyId: string) {
+    return db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Codex Coder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+  }
 
   async function seedTerminalWorkspace(options: {
     mergedPr?: boolean;
@@ -353,7 +453,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     });
     await db
       .update(executionWorkspaces)
-      .set({ sourceIssueId })
+      // Keep delivery eligibility independent of the sweep's JavaScript clock
+      // boundary; database defaultNow() can be a few microseconds newer.
+      .set({ sourceIssueId, updatedAt: new Date("2020-01-01T00:00:00Z") })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
     if (options.childStatus) {
       await db.insert(issues).values({
@@ -1059,6 +1161,33 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
     expect(workspace?.status).toBe("active");
   });
+
+  it("counts large untracked worktrees without allowing destructive cleanup", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const directory = path.join(seeded.worktreePath, ".worktrees", "task-retry");
+    await fs.mkdir(directory, { recursive: true });
+    for (let offset = 0; offset < 5_000; offset += 100) {
+      await Promise.all(Array.from({ length: 100 }, (_, index) =>
+        fs.writeFile(path.join(directory, `${offset + index}-${"source".repeat(32)}.ts`), "uncommitted\n"),
+      ));
+    }
+
+    const status = await execFileAsync(
+      "git",
+      ["-C", seeded.worktreePath, "status", "--porcelain", "--untracked-files=all"],
+      { maxBuffer: 2 * 1024 * 1024 },
+    );
+    expect(Buffer.byteLength(status.stdout, "utf8")).toBeGreaterThan(1024 * 1024);
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    expect(readiness?.git).toMatchObject({ hasUntrackedFiles: true, untrackedEntryCount: 5_000 });
+    expect(readiness?.warnings).toContain("The workspace has 5000 untracked files.");
+    expect(readiness?.blockingReasons).not.toContain(
+      "Paperclip could not verify the workspace git status. Retry before destructive cleanup.",
+    );
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
 
   it("refuses cleanup when the worktree changes after delivery assessment", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true });
@@ -2299,21 +2428,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       branchName: "feature/recorded",
       baseRef: "main",
     });
-    await db.insert(issueRecoveryActions).values({
-      companyId,
-      sourceIssueId: issueId,
-      kind: "workspace_validation",
-      status: "active",
-      ownerType: "board",
-      cause: "workspace_validation_failed",
-      fingerprint,
-      evidence: {
-        workspaceValidation: {
-          fingerprint,
-        },
-      },
-      nextAction: "Repair the source issue workspace link.",
-    });
+    await insertBoardWorkspaceRecovery(companyId, issueId, fingerprint);
 
     const result = await svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
       mode: "forward",
@@ -2406,21 +2521,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       status: "blocked",
       priority: "medium",
     });
-    await db.insert(executionWorkspaces).values({
-      id: executionWorkspaceId,
-      companyId,
-      projectId,
-      sourceIssueId: issueId,
-      mode: "isolated_workspace",
-      strategyType: "git_worktree",
-      name: "feature/never-created",
-      status: "idle",
-      providerType: "git_worktree",
-      cwd: worktreePath,
-      providerRef: worktreePath,
-      branchName: "feature/never-created",
-      baseRef: "main",
-    });
+    await insertMissingRecordedBranchWorkspace(executionWorkspaceId, companyId, projectId, issueId, worktreePath);
 
     const result = await svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
       mode: "forward",
@@ -2487,21 +2588,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       status: "blocked",
       priority: "medium",
     });
-    await db.insert(executionWorkspaces).values({
-      id: executionWorkspaceId,
-      companyId,
-      projectId,
-      sourceIssueId: issueId,
-      mode: "isolated_workspace",
-      strategyType: "git_worktree",
-      name: "feature/never-created",
-      status: "idle",
-      providerType: "git_worktree",
-      cwd: worktreePath,
-      providerRef: worktreePath,
-      branchName: "feature/never-created",
-      baseRef: "main",
-    });
+    await insertMissingRecordedBranchWorkspace(executionWorkspaceId, companyId, projectId, issueId, worktreePath);
 
     await expect(svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
       mode: "forward",
@@ -2560,21 +2647,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       status: "blocked",
       priority: "medium",
     });
-    await db.insert(executionWorkspaces).values({
-      id: executionWorkspaceId,
-      companyId,
-      projectId,
-      sourceIssueId: issueId,
-      mode: "isolated_workspace",
-      strategyType: "git_worktree",
-      name: "feature/never-created",
-      status: "idle",
-      providerType: "git_worktree",
-      cwd: worktreePath,
-      providerRef: worktreePath,
-      branchName: "feature/never-created",
-      baseRef: "main",
-    });
+    await insertMissingRecordedBranchWorkspace(executionWorkspaceId, companyId, projectId, issueId, worktreePath);
 
     await expect(svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
       mode: "forward",
@@ -2624,17 +2697,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       issuePrefix: "PAP",
       requireBoardApprovalForNewAgents: false,
     });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "Codex Coder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await insertActiveCodexCoder(agentId, companyId);
     await db.insert(projects).values({
       id: projectId,
       companyId,
@@ -2660,37 +2723,8 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       priority: "medium",
       assigneeAgentId: agentId,
     });
-    await db.insert(executionWorkspaces).values({
-      id: executionWorkspaceId,
-      companyId,
-      projectId,
-      projectWorkspaceId,
-      sourceIssueId: issueId,
-      mode: "isolated_workspace",
-      strategyType: "git_worktree",
-      name: "feature/recorded",
-      status: "active",
-      providerType: "git_worktree",
-      cwd: worktreePath,
-      providerRef: worktreePath,
-      branchName: "feature/recorded",
-      baseRef: "main",
-    });
-    await db.insert(issueRecoveryActions).values({
-      companyId,
-      sourceIssueId: issueId,
-      kind: "workspace_validation",
-      status: "active",
-      ownerType: "board",
-      cause: "workspace_validation_failed",
-      fingerprint,
-      evidence: {
-        workspaceValidation: {
-          fingerprint,
-        },
-      },
-      nextAction: "Repair the source issue workspace link.",
-    });
+    await insertRecordedBranchWorkspace(executionWorkspaceId, companyId, projectId, projectWorkspaceId, issueId, worktreePath);
+    await insertBoardWorkspaceRecovery(companyId, issueId, fingerprint);
 
     const result = await svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
       mode: "quarantine_restore",
@@ -2814,21 +2848,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       branchName: "feature/recorded",
       baseRef: "main",
     });
-    await db.insert(workspaceRuntimeServices).values({
-      id: runtimeServiceId,
-      companyId,
-      projectId,
-      executionWorkspaceId,
-      issueId,
-      scopeType: "execution_workspace",
-      serviceName: "web",
-      status: "running",
-      lifecycle: "shared",
-      command: "pnpm dev",
-      cwd: worktreePath,
-      provider: "local_process",
-      healthStatus: "healthy",
-    });
+    await insertRunningWorkspaceService(runtimeServiceId, companyId, projectId, executionWorkspaceId, issueId, worktreePath);
 
     await expect(svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
       mode: "quarantine_restore",
@@ -2972,37 +2992,8 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         lastDecisionOutcome: null,
       },
     });
-    await db.insert(executionWorkspaces).values({
-      id: executionWorkspaceId,
-      companyId,
-      projectId,
-      projectWorkspaceId,
-      sourceIssueId: issueId,
-      mode: "isolated_workspace",
-      strategyType: "git_worktree",
-      name: "feature/recorded",
-      status: "active",
-      providerType: "git_worktree",
-      cwd: worktreePath,
-      providerRef: worktreePath,
-      branchName: "feature/recorded",
-      baseRef: "main",
-    });
-    await db.insert(issueRecoveryActions).values({
-      companyId,
-      sourceIssueId: issueId,
-      kind: "workspace_validation",
-      status: "active",
-      ownerType: "board",
-      cause: "workspace_validation_failed",
-      fingerprint,
-      evidence: {
-        workspaceValidation: {
-          fingerprint,
-        },
-      },
-      nextAction: "Repair the source issue workspace link.",
-    });
+    await insertRecordedBranchWorkspace(executionWorkspaceId, companyId, projectId, projectWorkspaceId, issueId, worktreePath);
+    await insertBoardWorkspaceRecovery(companyId, issueId, fingerprint);
 
     const result = await svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
       mode: "quarantine_restore",
@@ -3083,17 +3074,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         issuePrefix: "PAP",
         requireBoardApprovalForNewAgents: false,
       });
-      await db.insert(agents).values({
-        id: agentId,
-        companyId,
-        name: "Codex Coder",
-        role: "engineer",
-        status: "active",
-        adapterType: "codex_local",
-        adapterConfig: {},
-        runtimeConfig: {},
-        permissions: {},
-      });
+      await insertActiveCodexCoder(agentId, companyId);
       await db.insert(projects).values({
         id: projectId,
         companyId,
@@ -3256,14 +3237,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       name: "Branch reconcile",
       status: "in_progress",
     });
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      projectId,
-      title: "Source task",
-      status: "blocked",
-      priority: "medium",
-    });
+    await insertBlockedSourceTask(issueId, companyId, projectId);
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
       companyId,
@@ -3341,14 +3315,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       name: "Branch reconcile",
       status: "in_progress",
     });
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      projectId,
-      title: "Source task",
-      status: "blocked",
-      priority: "medium",
-    });
+    await insertBlockedSourceTask(issueId, companyId, projectId);
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
       companyId,
@@ -3426,14 +3393,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       name: "Branch reconcile",
       status: "in_progress",
     });
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      projectId,
-      title: "Source task",
-      status: "blocked",
-      priority: "medium",
-    });
+    await insertBlockedSourceTask(issueId, companyId, projectId);
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
       companyId,
@@ -3530,14 +3490,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       name: "Branch reconcile",
       status: "in_progress",
     });
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      projectId,
-      title: "Source task",
-      status: "blocked",
-      priority: "medium",
-    });
+    await insertBlockedSourceTask(issueId, companyId, projectId);
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
       companyId,
@@ -3553,21 +3506,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       branchName: "feature/recorded",
       baseRef: "main",
     });
-    await db.insert(workspaceRuntimeServices).values({
-      id: runtimeServiceId,
-      companyId,
-      projectId,
-      executionWorkspaceId,
-      issueId,
-      scopeType: "execution_workspace",
-      serviceName: "web",
-      status: "running",
-      lifecycle: "shared",
-      command: "pnpm dev",
-      cwd: worktreePath,
-      provider: "local_process",
-      healthStatus: "healthy",
-    });
+    await insertRunningWorkspaceService(runtimeServiceId, companyId, projectId, executionWorkspaceId, issueId, worktreePath);
 
     await expect(svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
       mode: "override",
@@ -3637,14 +3576,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       name: "Branch reconcile",
       status: "in_progress",
     });
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      projectId,
-      title: "Source task",
-      status: "blocked",
-      priority: "medium",
-    });
+    await insertBlockedSourceTask(issueId, companyId, projectId);
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
       companyId,
@@ -3766,14 +3698,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       name: "Branch reconcile",
       status: "in_progress",
     });
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      projectId,
-      title: "Source task",
-      status: "blocked",
-      priority: "medium",
-    });
+    await insertBlockedSourceTask(issueId, companyId, projectId);
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
       companyId,
@@ -3801,6 +3726,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     ].join(" ");
     const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(serverScript)}`;
 
+    const portOwner = vi.spyOn(localServiceSupervisor, "readLocalServicePortOwner").mockResolvedValue(null);
+    const adoption = vi.spyOn(localServiceSupervisor, "findAdoptableLocalService").mockResolvedValue(null);
+    const runtimeOutput: string[] = [];
     let startedServices: Awaited<ReturnType<typeof startRuntimeServicesForWorkspaceControl>> = [];
     try {
       const startPromise = startRuntimeServicesForWorkspaceControl({
@@ -3847,9 +3775,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
           },
         },
         adapterEnv: {},
+        onLog: async (stream, chunk) => { runtimeOutput.push(`${stream}: ${chunk}`); },
       });
 
-      await Promise.race([
+      try {
+        await Promise.race([
         waitForPath(runtimeStartedMarker),
         startPromise.then(
           () => {
@@ -3859,7 +3789,13 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
             throw error;
           },
         ),
-      ]);
+        ]);
+      } catch (error) {
+        const activity = await db.execute(sql`select state, wait_event_type, wait_event,
+          left(query, 240) as query from pg_stat_activity
+          where datname = current_database() and pid <> pg_backend_pid()`);
+        throw new Error(`Runtime activation did not reach its process marker. Output: ${runtimeOutput.join("") || "<none>"}. Database activity: ${JSON.stringify(activity)}`, { cause: error });
+      }
 
       const reconcileErrorPromise = svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
         mode: "override",
@@ -3897,12 +3833,17 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         },
       });
     } finally {
-      await stopRuntimeServicesForExecutionWorkspace({
-        db,
-        executionWorkspaceId,
-        workspaceCwd: worktreePath,
-      });
-      await fs.rm(runtimeStartedMarker, { force: true });
+      try {
+        await stopRuntimeServicesForExecutionWorkspace({
+          db,
+          executionWorkspaceId,
+          workspaceCwd: worktreePath,
+        });
+        await fs.rm(runtimeStartedMarker, { force: true });
+      } finally {
+        portOwner.mockRestore();
+        adoption.mockRestore();
+      }
     }
 
     const [workspace] = await db
@@ -3949,14 +3890,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       name: "Branch reconcile",
       status: "in_progress",
     });
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      projectId,
-      title: "Source task",
-      status: "blocked",
-      priority: "medium",
-    });
+    await insertBlockedSourceTask(issueId, companyId, projectId);
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
       companyId,
