@@ -833,10 +833,14 @@ const MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS = new Set([
   "0376_late_logan.sql",
 ]);
 
+export type MigrationProgress = (phase: "inspect" | "reconcile" | "prepare" | "statement" | "journal" | "verify", file?: string, statement?: number) => void;
+
 async function applyPendingMigrationsManually(
   url: string,
   pendingMigrations: string[],
+  progress?: MigrationProgress,
 ): Promise<void> {
+  progress?.("prepare");
   if (pendingMigrations.length === 0) return;
 
   const orderedPendingMigrations = await orderMigrationsByJournal(pendingMigrations);
@@ -862,6 +866,7 @@ async function applyPendingMigrationsManually(
       const qualifiedTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
 
       for (const migrationFile of orderedPendingMigrations) {
+        progress?.("prepare", migrationFile);
         const migrationContent = await readMigrationFileContent(migrationFile);
         const hash = createHash("sha256").update(migrationContent).digest("hex");
         const existingEntry = await migrationHistoryEntryExists(
@@ -874,7 +879,9 @@ async function applyPendingMigrationsManually(
         if (existingEntry) continue;
 
         const applyMigration = async () => {
+          let ordinal = 0;
           for (const statement of splitMigrationStatements(migrationContent)) {
+            progress?.("statement", migrationFile, ++ordinal);
             if (MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS.has(migrationFile)) {
               // A cancelled concurrent build leaves an invalid index. IF NOT
               // EXISTS alone would skip it on retry and journal an incomplete index.
@@ -900,6 +907,7 @@ async function applyPendingMigrationsManually(
             await sql.unsafe(executable);
           }
 
+          progress?.("journal", migrationFile);
           await recordMigrationHistoryEntry(
             sql,
             qualifiedTable,
@@ -1267,6 +1275,7 @@ export type MigrationHistoryReconcileResult = {
 
 export async function reconcilePendingMigrationHistory(
   url: string,
+  progress?: MigrationProgress,
 ): Promise<MigrationHistoryReconcileResult> {
   const state = await inspectMigrations(url);
   if (state.status !== "needsMigrations" || state.reason !== "pending-migrations") {
@@ -1288,6 +1297,7 @@ export async function reconcilePendingMigrationHistory(
     const qualifiedTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
 
     for (const migrationFile of state.pendingMigrations) {
+      progress?.("reconcile", migrationFile);
       const migrationContent = await readMigrationFileContent(migrationFile);
       const alreadyApplied = await migrationContentAlreadyApplied(sql, migrationContent);
       if (!alreadyApplied) break;
@@ -1352,6 +1362,7 @@ export async function reconcilePendingMigrationHistory(
     await sql.end();
   }
 
+  progress?.("inspect");
   const refreshed = await inspectMigrations(url);
   return {
     repairedMigrations,
@@ -1448,14 +1459,16 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
   }
 }
 
-export async function applyPendingMigrations(url: string): Promise<void> {
+export async function applyPendingMigrations(url: string, progress?: MigrationProgress): Promise<void> {
+  progress?.("inspect");
   const initialState = await inspectMigrations(url);
   if (initialState.status === "upToDate") return;
 
   if (initialState.reason === "no-migration-journal-empty-db") {
     // Use the same per-file executor for bootstrap and upgrades: Drizzle wraps
     // the whole journal in one transaction and cannot run committing backfills.
-    await applyPendingMigrationsManually(url, initialState.pendingMigrations);
+    await applyPendingMigrationsManually(url, initialState.pendingMigrations, progress);
+    progress?.("verify");
     const bootstrappedState = await inspectMigrations(url);
     if (bootstrappedState.status === "upToDate") return;
     throw new Error(
@@ -1472,7 +1485,8 @@ export async function applyPendingMigrations(url: string): Promise<void> {
   let state = await inspectMigrations(url);
   if (state.status === "upToDate") return;
 
-  const repair = await reconcilePendingMigrationHistory(url);
+  progress?.("reconcile");
+  const repair = await reconcilePendingMigrationHistory(url, progress);
   if (repair.repairedMigrations.length > 0) {
     state = await inspectMigrations(url);
     if (state.status === "upToDate") return;
@@ -1482,7 +1496,8 @@ export async function applyPendingMigrations(url: string): Promise<void> {
     throw new Error("Migrations are still pending after migration-history reconciliation; run inspectMigrations for details.");
   }
 
-  await applyPendingMigrationsManually(url, state.pendingMigrations);
+  await applyPendingMigrationsManually(url, state.pendingMigrations, progress);
+  progress?.("verify");
 
   const finalState = await inspectMigrations(url);
   if (finalState.status !== "upToDate") {
