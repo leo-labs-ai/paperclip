@@ -58,8 +58,8 @@ jobs:
           client-id: Iv23liwPWAIcc4PAk2Dt
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
           # The App is installed on the transferred repository; request the
-          # lue-labs installation token so this workflow can write its sync PR.
-          owner: lue-labs
+          # leo-labs-ai installation token so this workflow can write its sync PR.
+          owner: leo-labs-ai
           repositories: paperclip
           permission-contents: write
           permission-pull-requests: write
